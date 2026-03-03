@@ -1,0 +1,4 @@
+rtt_ms	variant	client_jsonl	server_jsonl	raw_result_dir
+14	baseline	results/rtt_sweep/rtt14/baseline.jsonl	results/rtt_sweep/rtt14/baseline_server.jsonl	result/demo/dasd_workstation_baseline_rtt14_20260303_151029
+14	dasd_fixed	results/rtt_sweep/rtt14/dasd_fixed.jsonl	results/rtt_sweep/rtt14/dasd_fixed_server.jsonl	result/demo/dasd_workstation_dasd_fixed_rtt14_20260303_151048
+14	dasd_adaptive	results/rtt_sweep/rtt14/dasd_adaptive.jsonl	results/rtt_sweep/rtt14/dasd_adaptive_server.jsonl	result/demo/dasd_workstation_dasd_adaptive_rtt14_20260303_151053

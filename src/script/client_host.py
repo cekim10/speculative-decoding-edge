@@ -132,6 +132,42 @@ def main(config_file: str):
                 "SPECEDGE_DASD_ROLLBACK_AVOID_FAILED_TOKEN": dasd_cfg.get(
                     "rollback_avoid_failed_token", False
                 ),
+                "SPECEDGE_DASD_ADAPTIVE_CREDIT_ENABLED": dasd_cfg.get(
+                    "adaptive_credit_enabled", False
+                ),
+                "SPECEDGE_DASD_ADAPTIVE_WINDOW_ENABLED": dasd_cfg.get(
+                    "adaptive_window_enabled", False
+                ),
+                "SPECEDGE_DASD_ADAPTIVE_TREE_BUDGET_ENABLED": dasd_cfg.get(
+                    "adaptive_tree_budget_enabled", False
+                ),
+                "SPECEDGE_DASD_CREDIT_MIN": dasd_cfg.get("credit_min", 0),
+                "SPECEDGE_DASD_CREDIT_MAX": dasd_cfg.get(
+                    "credit_max", max(max_budget, dasd_cfg.get("W_max", max_budget))
+                ),
+                "SPECEDGE_DASD_CREDIT_INIT": dasd_cfg.get(
+                    "credit_init", dasd_cfg.get("start_window", 4)
+                ),
+                "SPECEDGE_DASD_REJECTION_PENALTY": dasd_cfg.get(
+                    "rejection_penalty", 1
+                ),
+                "SPECEDGE_DASD_SUCCESS_BONUS": dasd_cfg.get("success_bonus", 1),
+                "SPECEDGE_DASD_MIN_WINDOW": dasd_cfg.get(
+                    "min_window", dasd_cfg.get("W_min", 4)
+                ),
+                "SPECEDGE_DASD_MAX_WINDOW": dasd_cfg.get(
+                    "max_window", dasd_cfg.get("W_max", max_budget)
+                ),
+                "SPECEDGE_DASD_MIN_TREE_DEPTH": dasd_cfg.get("min_tree_depth", 1),
+                "SPECEDGE_DASD_MAX_TREE_DEPTH": dasd_cfg.get(
+                    "max_tree_depth", max_beam_len
+                ),
+                "SPECEDGE_DASD_MIN_LEAF_BUDGET": dasd_cfg.get(
+                    "min_leaf_budget", 4
+                ),
+                "SPECEDGE_DASD_MAX_LEAF_BUDGET": dasd_cfg.get(
+                    "max_leaf_budget", max_budget
+                ),
                 "SPECEDGE_DASD_DEBUG": dasd_cfg.get("debug", False),
             }
 

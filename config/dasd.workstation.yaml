@@ -46,6 +46,20 @@ dasd:
   beta: 0.5
   max_inflight_bundles: 4
   max_spec_buffer_tokens: 256
+  adaptive_credit_enabled: false
+  adaptive_window_enabled: false
+  adaptive_tree_budget_enabled: false
+  credit_min: 0
+  credit_max: 32
+  credit_init: 8
+  rejection_penalty: 1
+  success_bonus: 1
+  min_window: 4
+  max_window: 32
+  min_tree_depth: 1
+  max_tree_depth: 4
+  min_leaf_budget: 4
+  max_leaf_budget: 32
   global_budget_C_total: 0
   ema_decay: 0.9
   debug: false

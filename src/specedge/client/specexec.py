@@ -1,6 +1,7 @@
 import asyncio
 import socket
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Optional
 
@@ -10,7 +11,13 @@ import torch
 import log
 import util
 from config import SpecEdgeClientConfig as config
-from specedge.client.dasd_client import DasdBundleResult, DasdRequestState, DasdTaskInfo
+from specedge.client.dasd_client import (
+    DasdBundleResult,
+    DasdCreditController,
+    DasdRequestState,
+    DasdTaskInfo,
+    DasdTreeBudget,
+)
 from specedge.client.proactive import SpecExecProactiveDraft
 from specedge.network.grpc import GrpcClientController
 from specedge.tree import Tree
@@ -43,6 +50,10 @@ class SpecExecClient:
         self._max_beam_len = config.max_beam_len
         self._max_branch_width = config.max_branch_width
         self._max_budget = config.max_budget
+        self._fixed_max_n_beams = self._max_n_beams
+        self._fixed_max_beam_len = self._max_beam_len
+        self._fixed_max_branch_width = self._max_branch_width
+        self._fixed_max_budget = self._max_budget
 
         self._proactive_type = config.proactive_type
 
@@ -188,6 +199,30 @@ class SpecExecClient:
             window_size=max(
                 config.dasd_w_min, min(config.dasd_w_max, config.dasd_start_window)
             ),
+            credit_controller=DasdCreditController(
+                adaptive_enabled=config.dasd_adaptive_credit_enabled,
+                adaptive_window_enabled=config.dasd_adaptive_window_enabled,
+                adaptive_tree_budget_enabled=config.dasd_adaptive_tree_budget_enabled,
+                credit_min=config.dasd_credit_min,
+                credit_max=max(config.dasd_credit_min, config.dasd_credit_max),
+                credit=max(
+                    config.dasd_credit_min,
+                    min(config.dasd_credit_max, config.dasd_credit_init),
+                ),
+                rejection_penalty=config.dasd_rejection_penalty,
+                success_bonus=config.dasd_success_bonus,
+                min_window=config.dasd_min_window,
+                max_window=config.dasd_max_window,
+                min_tree_depth=config.dasd_min_tree_depth,
+                max_tree_depth=config.dasd_max_tree_depth,
+                min_leaf_budget=config.dasd_min_leaf_budget,
+                max_leaf_budget=config.dasd_max_leaf_budget,
+            ),
+        )
+        self._refresh_dasd_control_targets(
+            state,
+            reason="init",
+            next_credit=state.window_size,
         )
         start_ts = time.perf_counter()
 
@@ -258,6 +293,11 @@ class SpecExecClient:
                 "total_latency_ms": total_latency_ms,
                 "aborted": state.aborted,
                 "abort_reason": state.abort_reason,
+                "final_credit": (
+                    state.credit_controller.credit
+                    if state.credit_controller is not None
+                    else None
+                ),
                 "mode": "dasd",
             }
         )
@@ -267,6 +307,94 @@ class SpecExecClient:
             "Generated sequence: \n%s",
             self._tokenizer.decode(self._prefix_tokens[0], skip_special_tokens=True),
         )
+
+    def _refresh_dasd_control_targets(
+        self,
+        state: DasdRequestState,
+        reason: str,
+        next_credit: Optional[int] = None,
+        feedback: Optional[dict] = None,
+    ):
+        if state.credit_controller is None:
+            state.tree_budget = DasdTreeBudget(
+                max_beam_len=self._fixed_max_beam_len,
+                max_budget=self._fixed_max_budget,
+                max_n_beams=self._fixed_max_n_beams,
+                max_branch_width=self._fixed_max_branch_width,
+            )
+            return
+
+        previous_window = state.window_size
+        previous_tree_budget = state.tree_budget
+
+        if (
+            config.dasd_adaptive_credit_enabled
+            and config.dasd_adaptive_window_enabled
+        ):
+            fallback_window = (
+                previous_window
+                if previous_window > 0
+                else max(config.dasd_w_min, min(config.dasd_w_max, config.dasd_start_window))
+            )
+            state.window_size = state.credit_controller.current_window(fallback_window)
+        elif next_credit is not None and next_credit > 0:
+            state.window_size = max(
+                config.dasd_w_min, min(config.dasd_w_max, int(next_credit))
+            )
+
+        state.tree_budget = state.credit_controller.current_tree_budget(
+            fallback_depth=self._fixed_max_beam_len,
+            fallback_leaf_budget=self._fixed_max_budget,
+            fallback_max_n_beams=self._fixed_max_n_beams,
+            fallback_max_branch_width=self._fixed_max_branch_width,
+        )
+
+        if config.dasd_debug:
+            self._logger.info(
+                "[DASD] credit_control req=%s epoch=%d reason=%s credit_before=%s credit_after=%s accepted=%s proposed=%s rejected=%s strong_accept_streak=%s full_rejection_streak=%s W_before=%s W_after=%s tree_before=%s tree_after=%s",
+                state.request_id,
+                state.epoch,
+                reason,
+                feedback.get("credit_before") if feedback is not None else state.credit_controller.credit,
+                feedback.get("credit_after") if feedback is not None else state.credit_controller.credit,
+                feedback.get("accepted_len") if feedback is not None else None,
+                feedback.get("proposed_len") if feedback is not None else None,
+                feedback.get("rejected_len") if feedback is not None else None,
+                feedback.get("strong_accept_streak") if feedback is not None else None,
+                feedback.get("full_rejection_streak") if feedback is not None else None,
+                previous_window,
+                state.window_size,
+                previous_tree_budget,
+                state.tree_budget,
+            )
+
+    @contextmanager
+    def _dasd_tree_budget_context(self, state: DasdRequestState):
+        previous = (
+            self._max_beam_len,
+            self._max_budget,
+            self._max_n_beams,
+            self._max_branch_width,
+        )
+        tree_budget = state.tree_budget or DasdTreeBudget(
+            max_beam_len=self._fixed_max_beam_len,
+            max_budget=self._fixed_max_budget,
+            max_n_beams=self._fixed_max_n_beams,
+            max_branch_width=self._fixed_max_branch_width,
+        )
+        self._max_beam_len = tree_budget.max_beam_len
+        self._max_budget = tree_budget.max_budget
+        self._max_n_beams = tree_budget.max_n_beams
+        self._max_branch_width = tree_budget.max_branch_width
+        try:
+            yield tree_budget
+        finally:
+            (
+                self._max_beam_len,
+                self._max_budget,
+                self._max_n_beams,
+                self._max_branch_width,
+            ) = previous
 
     async def _fill_inflight_for_dasd(self, state: DasdRequestState):
         if state.aborted:
@@ -328,6 +456,27 @@ class SpecExecClient:
             epoch_at_send=state.epoch,
             inflight_at_send=len(state.inflight) + 1,
             send_ts=send_ts,
+            window_size_at_send=state.window_size,
+            credit_at_send=(
+                state.credit_controller.credit
+                if state.credit_controller is not None
+                else state.window_size
+            ),
+            tree_depth_at_send=(
+                state.tree_budget.max_beam_len
+                if state.tree_budget is not None
+                else self._fixed_max_beam_len
+            ),
+            leaf_budget_at_send=(
+                state.tree_budget.max_budget
+                if state.tree_budget is not None
+                else self._fixed_max_budget
+            ),
+            branch_width_at_send=(
+                state.tree_budget.max_branch_width
+                if state.tree_budget is not None
+                else self._fixed_max_branch_width
+            ),
         )
         state.inflight[bundle_id] = task_info
         state.task_to_bundle[task] = bundle_id
@@ -335,13 +484,17 @@ class SpecExecClient:
         state.next_base_index += state.window_size
         if config.dasd_debug:
             self._logger.info(
-                "[DASD] send req=%s bundle=%d epoch=%d base=%d W=%d inflight=%d tokens=%s",
+                "[DASD] send req=%s bundle=%d epoch=%d base=%d W=%d inflight=%d credit=%s tree_depth=%s leaf_budget=%s branch_width=%s tokens=%s",
                 state.request_id,
                 bundle_id,
                 state.epoch,
                 base_token_index,
                 len(token_ids),
                 len(state.inflight),
+                task_info.credit_at_send,
+                task_info.tree_depth_at_send,
+                task_info.leaf_budget_at_send,
+                task_info.branch_width_at_send,
                 token_ids,
             )
 
@@ -427,10 +580,18 @@ class SpecExecClient:
             verifier_poisoned = bool(
                 getattr(result.response, "verifier_poisoned", False)
             )
-            if next_credit > 0:
-                state.window_size = max(
-                    config.dasd_w_min, min(config.dasd_w_max, next_credit)
+            control_feedback = None
+            if state.credit_controller is not None:
+                control_feedback = state.credit_controller.apply_feedback(
+                    accepted_len=accepted_len,
+                    proposed_len=verified_len,
                 )
+            self._refresh_dasd_control_targets(
+                state,
+                reason="verifier_response",
+                next_credit=next_credit,
+                feedback=control_feedback,
+            )
 
             state.total_verified_tokens += verified_len
             state.total_accepted_tokens += accepted_len
@@ -448,12 +609,17 @@ class SpecExecClient:
                 state.consecutive_full_rejections = 0
             if config.dasd_debug:
                 self._logger.info(
-                    "[DASD] commit req=%s bundle=%d accepted=%d/%d committed=%d",
+                    "[DASD] commit req=%s bundle=%d accepted=%d/%d committed=%d credit=%s W=%d tree_budget=%s",
                     state.request_id,
                     int(result.response.bundle_id),
                     accepted_len,
                     verified_len,
                     state.committed_len,
+                    state.credit_controller.credit
+                    if state.credit_controller is not None
+                    else None,
+                    state.window_size,
+                    state.tree_budget,
                 )
 
             self._result_logger.log(
@@ -469,9 +635,49 @@ class SpecExecClient:
                     "rtt_ms": rtt_ms,
                     "epoch_at_send": task_info.epoch_at_send,
                     "inflight_at_send": task_info.inflight_at_send,
+                    "credit_at_send": task_info.credit_at_send,
+                    "tree_depth_at_send": task_info.tree_depth_at_send,
+                    "leaf_budget_at_send": task_info.leaf_budget_at_send,
+                    "branch_width_at_send": task_info.branch_width_at_send,
                     "accepted_len": accepted_len,
                     "r_obs": float(result.response.r_obs),
                     "next_credit": next_credit,
+                    "credit_before": (
+                        control_feedback.get("credit_before")
+                        if control_feedback is not None
+                        else None
+                    ),
+                    "credit_after": (
+                        control_feedback.get("credit_after")
+                        if control_feedback is not None
+                        else None
+                    ),
+                    "strong_accept_streak": (
+                        control_feedback.get("strong_accept_streak")
+                        if control_feedback is not None
+                        else None
+                    ),
+                    "full_rejection_streak": (
+                        control_feedback.get("full_rejection_streak")
+                        if control_feedback is not None
+                        else None
+                    ),
+                    "chosen_window": state.window_size,
+                    "chosen_tree_depth": (
+                        state.tree_budget.max_beam_len
+                        if state.tree_budget is not None
+                        else None
+                    ),
+                    "chosen_leaf_budget": (
+                        state.tree_budget.max_budget
+                        if state.tree_budget is not None
+                        else None
+                    ),
+                    "chosen_branch_width": (
+                        state.tree_budget.max_branch_width
+                        if state.tree_budget is not None
+                        else None
+                    ),
                     "server_queue_delay_ms": float(
                         result.response.server_queue_delay_ms
                     ),
@@ -550,11 +756,16 @@ class SpecExecClient:
                         max(0, state.committed_len - 8) : state.committed_len
                     ]
                     self._logger.info(
-                        "[DASD] rollback req=%s epoch=%d committed=%d failed_first_token=%s prefix_tail=%s prefix_tail_text=%r",
+                        "[DASD] rollback req=%s epoch=%d committed=%d failed_first_token=%s credit=%s W=%d tree_budget=%s prefix_tail=%s prefix_tail_text=%r",
                         state.request_id,
                         state.epoch,
                         state.committed_len,
                         failed_first_token,
+                        state.credit_controller.credit
+                        if state.credit_controller is not None
+                        else None,
+                        state.window_size,
+                        state.tree_budget,
                         committed_prefix_tail,
                         self._decode_dasd_debug_tokens(committed_prefix_tail),
                     )
@@ -606,10 +817,15 @@ class SpecExecClient:
                 ]
                 drafted_suffix = state.drafted_tokens[state.committed_len :]
                 self._logger.info(
-                    "[DASD] regrow_start req=%s epoch=%d committed=%d prefix_tail=%s drafted_suffix=%s use_full_drafted=%s",
+                    "[DASD] regrow_start req=%s epoch=%d committed=%d credit=%s W=%d tree_budget=%s prefix_tail=%s drafted_suffix=%s use_full_drafted=%s",
                     state.request_id,
                     state.epoch,
                     state.committed_len,
+                    state.credit_controller.credit
+                    if state.credit_controller is not None
+                    else None,
+                    state.window_size,
+                    state.tree_budget,
                     committed_prefix_tail,
                     drafted_suffix,
                     use_full_drafted,
@@ -617,15 +833,17 @@ class SpecExecClient:
             self._reset_tree_from_dasd_state(
                 state, use_full_drafted=use_full_drafted
             )
-            self._grow_tree(prefill=True)
+            with self._dasd_tree_budget_context(state) as tree_budget:
+                self._grow_tree(prefill=True)
             self._log_dasd_leaf_candidates(state)
             path_tokens = self._extract_best_path_tokens(state)
             if config.dasd_debug:
                 self._logger.info(
-                    "[DASD] regrow_path req=%s epoch=%d committed=%d path_tokens=%s first_proposed=%s first_path_text=%r",
+                    "[DASD] regrow_path req=%s epoch=%d committed=%d tree_budget=%s path_tokens=%s first_proposed=%s first_path_text=%r",
                     state.request_id,
                     state.epoch,
                     state.committed_len,
+                    tree_budget,
                     path_tokens.tolist(),
                     path_tokens[0].item() if path_tokens.numel() > 0 else None,
                     self._decode_dasd_debug_tokens(path_tokens[:8].tolist()),

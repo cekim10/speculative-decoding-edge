@@ -148,6 +148,42 @@ class SpecEdgeClientConfig(metaclass=_ConfigMeta):
         cls.dasd_rollback_avoid_failed_token = (
             os.getenv("SPECEDGE_DASD_ROLLBACK_AVOID_FAILED_TOKEN", "False") == "True"
         )
+        cls.dasd_adaptive_credit_enabled = (
+            os.getenv("SPECEDGE_DASD_ADAPTIVE_CREDIT_ENABLED", "False") == "True"
+        )
+        cls.dasd_adaptive_window_enabled = (
+            os.getenv("SPECEDGE_DASD_ADAPTIVE_WINDOW_ENABLED", "False") == "True"
+        )
+        cls.dasd_adaptive_tree_budget_enabled = (
+            os.getenv("SPECEDGE_DASD_ADAPTIVE_TREE_BUDGET_ENABLED", "False") == "True"
+        )
+        cls.dasd_credit_min = int(os.getenv("SPECEDGE_DASD_CREDIT_MIN", "0"))
+        cls.dasd_credit_max = int(
+            os.getenv("SPECEDGE_DASD_CREDIT_MAX", str(max(cls.max_budget, cls.dasd_w_max)))
+        )
+        cls.dasd_credit_init = int(
+            os.getenv("SPECEDGE_DASD_CREDIT_INIT", str(cls.dasd_start_window))
+        )
+        cls.dasd_rejection_penalty = int(
+            os.getenv("SPECEDGE_DASD_REJECTION_PENALTY", "1")
+        )
+        cls.dasd_success_bonus = int(os.getenv("SPECEDGE_DASD_SUCCESS_BONUS", "1"))
+        cls.dasd_min_window = int(
+            os.getenv("SPECEDGE_DASD_MIN_WINDOW", str(cls.dasd_w_min))
+        )
+        cls.dasd_max_window = int(
+            os.getenv("SPECEDGE_DASD_MAX_WINDOW", str(cls.dasd_w_max))
+        )
+        cls.dasd_min_tree_depth = int(os.getenv("SPECEDGE_DASD_MIN_TREE_DEPTH", "1"))
+        cls.dasd_max_tree_depth = int(
+            os.getenv("SPECEDGE_DASD_MAX_TREE_DEPTH", str(cls.max_beam_len))
+        )
+        cls.dasd_min_leaf_budget = int(
+            os.getenv("SPECEDGE_DASD_MIN_LEAF_BUDGET", "4")
+        )
+        cls.dasd_max_leaf_budget = int(
+            os.getenv("SPECEDGE_DASD_MAX_LEAF_BUDGET", str(cls.max_budget))
+        )
         cls.dasd_debug = os.getenv("SPECEDGE_DASD_DEBUG", "False") == "True"
 
         cls._initialized = True

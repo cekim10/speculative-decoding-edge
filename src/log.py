@@ -5,7 +5,12 @@ import logging.config
 import logging.handlers
 import weakref
 from pathlib import Path
-from typing import ClassVar, Optional, Self
+from typing import ClassVar, Optional
+
+try:
+    from typing import Self
+except ImportError:
+    from typing_extensions import Self
 
 RESULT_DATA_PREFIX = "_data"
 

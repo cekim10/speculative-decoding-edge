@@ -535,11 +535,15 @@ class SpecExecClient:
                 state.next_base_index = state.committed_len
                 self._reset_tree_from_dasd_state(state, use_full_drafted=False)
                 if config.dasd_debug:
+                    committed_prefix_tail = state.drafted_tokens[
+                        max(0, state.committed_len - 8) : state.committed_len
+                    ]
                     self._logger.info(
-                        "[DASD] rollback req=%s epoch=%d committed=%d",
+                        "[DASD] rollback req=%s epoch=%d committed=%d prefix_tail=%s",
                         state.request_id,
                         state.epoch,
                         state.committed_len,
+                        committed_prefix_tail,
                     )
                 return
 
@@ -582,9 +586,35 @@ class SpecExecClient:
         appended = 0
         while appended < target_tokens and max_attempt > 0:
             max_attempt -= 1
-            self._reset_tree_from_dasd_state(state, use_full_drafted=True)
+            use_full_drafted = len(state.drafted_tokens) > state.committed_len
+            if config.dasd_debug:
+                committed_prefix_tail = state.drafted_tokens[
+                    max(0, state.committed_len - 8) : state.committed_len
+                ]
+                drafted_suffix = state.drafted_tokens[state.committed_len :]
+                self._logger.info(
+                    "[DASD] regrow_start req=%s epoch=%d committed=%d prefix_tail=%s drafted_suffix=%s use_full_drafted=%s",
+                    state.request_id,
+                    state.epoch,
+                    state.committed_len,
+                    committed_prefix_tail,
+                    drafted_suffix,
+                    use_full_drafted,
+                )
+            self._reset_tree_from_dasd_state(
+                state, use_full_drafted=use_full_drafted
+            )
             self._grow_tree(prefill=True)
             path_tokens = self._extract_best_path_tokens()
+            if config.dasd_debug:
+                self._logger.info(
+                    "[DASD] regrow_path req=%s epoch=%d committed=%d path_tokens=%s first_proposed=%s",
+                    state.request_id,
+                    state.epoch,
+                    state.committed_len,
+                    path_tokens.tolist(),
+                    path_tokens[0].item() if path_tokens.numel() > 0 else None,
+                )
             if path_tokens.numel() == 0:
                 break
 
@@ -644,6 +674,18 @@ class SpecExecClient:
             )
         else:
             self._prefix_tokens = self._initial_prefix_tokens.clone()
+
+        if config.dasd_debug:
+            prefix_tail = self._prefix_tokens[0, max(0, self._prefix_tokens.size(-1) - 8) :]
+            self._logger.info(
+                "[DASD] reset_tree req=%s epoch=%d committed=%d use_full_drafted=%s prefix_len=%d prefix_tail=%s",
+                state.request_id,
+                state.epoch,
+                state.committed_len,
+                use_full_drafted,
+                self._prefix_tokens.size(-1),
+                prefix_tail.tolist(),
+            )
 
         self._engine.reset()
         self._tree = Tree(

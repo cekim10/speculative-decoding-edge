@@ -539,11 +539,12 @@ class SpecExecClient:
                         max(0, state.committed_len - 8) : state.committed_len
                     ]
                     self._logger.info(
-                        "[DASD] rollback req=%s epoch=%d committed=%d prefix_tail=%s",
+                        "[DASD] rollback req=%s epoch=%d committed=%d prefix_tail=%s prefix_tail_text=%r",
                         state.request_id,
                         state.epoch,
                         state.committed_len,
                         committed_prefix_tail,
+                        self._decode_dasd_debug_tokens(committed_prefix_tail),
                     )
                 return
 
@@ -605,15 +606,17 @@ class SpecExecClient:
                 state, use_full_drafted=use_full_drafted
             )
             self._grow_tree(prefill=True)
-            path_tokens = self._extract_best_path_tokens()
+            self._log_dasd_leaf_candidates(state)
+            path_tokens = self._extract_best_path_tokens(state)
             if config.dasd_debug:
                 self._logger.info(
-                    "[DASD] regrow_path req=%s epoch=%d committed=%d path_tokens=%s first_proposed=%s",
+                    "[DASD] regrow_path req=%s epoch=%d committed=%d path_tokens=%s first_proposed=%s first_path_text=%r",
                     state.request_id,
                     state.epoch,
                     state.committed_len,
                     path_tokens.tolist(),
                     path_tokens[0].item() if path_tokens.numel() > 0 else None,
+                    self._decode_dasd_debug_tokens(path_tokens[:8].tolist()),
                 )
             if path_tokens.numel() == 0:
                 break
@@ -622,7 +625,7 @@ class SpecExecClient:
             state.drafted_tokens.extend(path_tokens[:append_len].tolist())
             appended += append_len
 
-    def _extract_best_path_tokens(self):
+    def _extract_best_path_tokens(self, state: Optional[DasdRequestState] = None):
         if self._tree.end <= self._tree.prefix_len:
             return torch.tensor([], dtype=torch.long, device=self._device)
 
@@ -653,9 +656,21 @@ class SpecExecClient:
             return torch.tensor([], dtype=torch.long, device=self._device)
 
         path_indices.reverse()
-        return self._tree.tokens[
+        path_tokens = self._tree.tokens[
             torch.tensor(path_indices, dtype=torch.long, device=self._device)
         ]
+        if config.dasd_debug and state is not None:
+            self._logger.info(
+                "[DASD] best_path req=%s epoch=%d committed=%d best_leaf=%d path_indices=%s path_tokens=%s path_text=%r",
+                state.request_id,
+                state.epoch,
+                state.committed_len,
+                int(best_leaf.item()),
+                path_indices,
+                path_tokens.tolist(),
+                self._decode_dasd_debug_tokens(path_tokens[:8].tolist()),
+            )
+        return path_tokens
 
     def _reset_tree_from_dasd_state(
         self, state: DasdRequestState, use_full_drafted: bool = False
@@ -694,6 +709,74 @@ class SpecExecClient:
             dtype=self._dtype,
             max_len=self._engine.max_len,
         )
+
+    def _log_dasd_leaf_candidates(self, state: DasdRequestState):
+        if not config.dasd_debug or self._tree.end <= self._tree.prefix_len:
+            return
+
+        all_indices = torch.arange(
+            self._tree.prefix_len, self._tree.end, dtype=torch.long, device=self._device
+        )
+        parent_mask = torch.zeros(self._tree.end, dtype=torch.bool, device=self._device)
+        parent_mask[self._tree.parents[self._tree.prefix_len : self._tree.end]] = True
+        leaf_indices = all_indices[~parent_mask[all_indices]]
+        if leaf_indices.numel() == 0:
+            leaf_indices = all_indices
+
+        leaf_depths = self._tree.positions[leaf_indices]
+        leaf_scores = self._tree.logprobs[leaf_indices]
+        max_depth = int(leaf_depths.max().item()) if leaf_depths.numel() > 0 else -1
+        deepest = leaf_indices[leaf_depths == max_depth] if leaf_depths.numel() > 0 else leaf_indices
+        if deepest.numel() == 0:
+            best_leaf = None
+        elif deepest.numel() == 1:
+            best_leaf = deepest[0]
+        else:
+            best_leaf = deepest[self._tree.logprobs[deepest].argmax()]
+
+        topk = min(8, leaf_indices.numel())
+        order = torch.argsort(leaf_scores, descending=True)[:topk]
+        summaries = []
+        for idx in order.tolist():
+            leaf_idx = int(leaf_indices[idx].item())
+            first_cont_token = self._first_continuation_token_for_leaf(leaf_idx)
+            summaries.append(
+                {
+                    "leaf_idx": leaf_idx,
+                    "depth": int(leaf_depths[idx].item()),
+                    "score": float(leaf_scores[idx].item()),
+                    "first_token": first_cont_token,
+                }
+            )
+
+        self._logger.info(
+            "[DASD] leaf_candidates req=%s epoch=%d committed=%d num_leaves=%d best_leaf=%s top_leaves=%s",
+            state.request_id,
+            state.epoch,
+            state.committed_len,
+            int(leaf_indices.numel()),
+            int(best_leaf.item()) if best_leaf is not None else None,
+            summaries,
+        )
+
+    def _first_continuation_token_for_leaf(self, leaf_idx: int):
+        cursor = torch.tensor(leaf_idx, dtype=torch.long, device=self._device)
+        first_token = None
+        while cursor >= self._tree.prefix_len:
+            first_token = int(self._tree.tokens[cursor].item())
+            parent = self._tree.parents[cursor]
+            if parent < self._tree.prefix_len:
+                break
+            cursor = parent
+        return first_token
+
+    def _decode_dasd_debug_tokens(self, token_ids: list[int]):
+        if not token_ids:
+            return ""
+        try:
+            return self._tokenizer.decode(token_ids, skip_special_tokens=False)
+        except Exception:
+            return "<decode_error>"
 
     def _grow_tree(self, prefill: bool):
         self._logger.debug("Growing tree")

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 
 @dataclass
@@ -39,6 +39,8 @@ class DasdRequestState:
     consecutive_rpc_failures: int = 0
     aborted: bool = False
     abort_reason: str = ""
+    rollback_blocked_committed_len: Optional[int] = None
+    rollback_blocked_token_id: Optional[int] = None
 
     def speculative_tokens(self):
         return max(0, len(self.drafted_tokens) - self.committed_len)

@@ -129,6 +129,9 @@ def main(config_file: str):
                 "SPECEDGE_DASD_MAX_SPEC_BUFFER_TOKENS": dasd_cfg.get(
                     "max_spec_buffer_tokens", 256
                 ),
+                "SPECEDGE_DASD_ROLLBACK_AVOID_FAILED_TOKEN": dasd_cfg.get(
+                    "rollback_avoid_failed_token", False
+                ),
                 "SPECEDGE_DASD_DEBUG": dasd_cfg.get("debug", False),
             }
 

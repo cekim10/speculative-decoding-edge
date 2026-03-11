@@ -145,6 +145,9 @@ class SpecEdgeClientConfig(metaclass=_ConfigMeta):
         cls.dasd_abort_after_failures = int(
             os.getenv("SPECEDGE_DASD_ABORT_AFTER_FAILURES", "4")
         )
+        cls.dasd_rollback_avoid_failed_token = (
+            os.getenv("SPECEDGE_DASD_ROLLBACK_AVOID_FAILED_TOKEN", "False") == "True"
+        )
         cls.dasd_debug = os.getenv("SPECEDGE_DASD_DEBUG", "False") == "True"
 
         cls._initialized = True

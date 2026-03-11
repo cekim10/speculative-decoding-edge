@@ -48,6 +48,7 @@ dasd:
   max_spec_buffer_tokens: 32
   global_budget_C_total: 0
   ema_decay: 0.9
+  rollback_avoid_failed_token: true
   debug: true
 node:
   localhost:

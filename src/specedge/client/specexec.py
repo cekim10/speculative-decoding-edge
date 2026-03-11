@@ -436,6 +436,12 @@ class SpecExecClient:
             state.total_accepted_tokens += accepted_len
             state.committed_len += accepted_len
             assert state.committed_len >= prev_committed
+            if (
+                state.rollback_blocked_committed_len is not None
+                and state.committed_len > state.rollback_blocked_committed_len
+            ):
+                state.rollback_blocked_committed_len = None
+                state.rollback_blocked_token_id = None
             if accepted_len == 0:
                 state.consecutive_full_rejections += 1
             else:
@@ -516,6 +522,11 @@ class SpecExecClient:
 
             if accepted_len < verified_len:
                 state.rollbacks_count += 1
+                failed_first_token = None
+                if accepted_len < len(task_info.token_ids):
+                    failed_first_token = int(task_info.token_ids[accepted_len])
+                state.rollback_blocked_committed_len = state.committed_len
+                state.rollback_blocked_token_id = failed_first_token
                 state.epoch += 1
 
                 cancelled_tasks = []
@@ -539,10 +550,11 @@ class SpecExecClient:
                         max(0, state.committed_len - 8) : state.committed_len
                     ]
                     self._logger.info(
-                        "[DASD] rollback req=%s epoch=%d committed=%d prefix_tail=%s prefix_tail_text=%r",
+                        "[DASD] rollback req=%s epoch=%d committed=%d failed_first_token=%s prefix_tail=%s prefix_tail_text=%r",
                         state.request_id,
                         state.epoch,
                         state.committed_len,
+                        failed_first_token,
                         committed_prefix_tail,
                         self._decode_dasd_debug_tokens(committed_prefix_tail),
                     )
@@ -646,6 +658,56 @@ class SpecExecClient:
         else:
             best_leaf = deepest[self._tree.logprobs[deepest].argmax()]
 
+        blocked_token = None
+        filtered_leaf_indices = deepest
+        filtered_first_tokens = None
+        if (
+            config.dasd_rollback_avoid_failed_token
+            and state is not None
+            and state.rollback_blocked_committed_len == state.committed_len
+            and state.rollback_blocked_token_id is not None
+        ):
+            blocked_token = int(state.rollback_blocked_token_id)
+            first_tokens = torch.tensor(
+                [
+                    self._first_continuation_token_for_leaf(int(leaf_idx.item()))
+                    for leaf_idx in deepest
+                ],
+                dtype=torch.long,
+                device=self._device,
+            )
+            keep_mask = first_tokens != blocked_token
+            filtered_first_tokens = first_tokens.tolist()
+            if torch.any(keep_mask):
+                filtered_leaf_indices = deepest[keep_mask]
+                if filtered_leaf_indices.numel() == 1:
+                    best_leaf = filtered_leaf_indices[0]
+                else:
+                    best_leaf = filtered_leaf_indices[
+                        self._tree.logprobs[filtered_leaf_indices].argmax()
+                    ]
+                if config.dasd_debug:
+                    self._logger.info(
+                        "[DASD] rollback_filter req=%s epoch=%d committed=%d blocked_token=%s deepest_leaves=%s deepest_first_tokens=%s kept_leaves=%s",
+                        state.request_id,
+                        state.epoch,
+                        state.committed_len,
+                        blocked_token,
+                        deepest.tolist(),
+                        filtered_first_tokens,
+                        filtered_leaf_indices.tolist(),
+                    )
+            elif config.dasd_debug:
+                self._logger.info(
+                    "[DASD] rollback_filter req=%s epoch=%d committed=%d blocked_token=%s no_alternative_leaf deepest_leaves=%s deepest_first_tokens=%s",
+                    state.request_id,
+                    state.epoch,
+                    state.committed_len,
+                    blocked_token,
+                    deepest.tolist(),
+                    filtered_first_tokens,
+                )
+
         path_indices = []
         cursor = best_leaf
         while cursor >= self._tree.prefix_len:
@@ -661,11 +723,12 @@ class SpecExecClient:
         ]
         if config.dasd_debug and state is not None:
             self._logger.info(
-                "[DASD] best_path req=%s epoch=%d committed=%d best_leaf=%d path_indices=%s path_tokens=%s path_text=%r",
+                "[DASD] best_path req=%s epoch=%d committed=%d best_leaf=%d blocked_token=%s path_indices=%s path_tokens=%s path_text=%r",
                 state.request_id,
                 state.epoch,
                 state.committed_len,
                 int(best_leaf.item()),
+                blocked_token,
                 path_indices,
                 path_tokens.tolist(),
                 self._decode_dasd_debug_tokens(path_tokens[:8].tolist()),

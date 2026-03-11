@@ -1295,27 +1295,46 @@ class DasdInferenceController:
         self, client_id: str, request_id: str, epoch: int, bundle_id: int
     ):
         state = self._slot_states.get(client_id)
-        if (
-            state is not None
-            and state.request_id == request_id
-            and state.epoch == epoch
-        ):
-            self._dasd_debug_log(
-                "state_reuse",
-                client_id=client_id,
-                request_id=request_id,
-                bundle_id=bundle_id,
-                epoch=epoch,
-                state=state,
-                new_state=False,
-            )
-            return state
 
         previous_epoch = self._client_epochs.get(client_id, -1)
         if epoch < previous_epoch:
             raise RuntimeError(
                 f"stale epoch for client {client_id}: request epoch {epoch} < current {previous_epoch}"
             )
+
+        if state is not None and state.request_id == request_id:
+            previous_committed_len = len(state.committed_tokens) - state.prompt_len
+            if epoch < state.epoch:
+                raise RuntimeError(
+                    f"stale epoch for client {client_id}: request epoch {epoch} < state epoch {state.epoch}"
+                )
+            if epoch == state.epoch:
+                self._dasd_debug_log(
+                    "state_reuse",
+                    client_id=client_id,
+                    request_id=request_id,
+                    bundle_id=bundle_id,
+                    epoch=epoch,
+                    state=state,
+                    new_state=False,
+                )
+                return state
+
+            state.epoch = epoch
+            self._client_epochs[client_id] = epoch
+            self._dasd_debug_log(
+                "epoch_transition_preserve_state",
+                client_id=client_id,
+                request_id=request_id,
+                bundle_id=bundle_id,
+                epoch=epoch,
+                state=state,
+                previous_committed_len=previous_committed_len,
+                preserved_committed_len=previous_committed_len,
+                new_generated_committed_len=len(state.committed_tokens) - state.prompt_len,
+                new_state=False,
+            )
+            return state
 
         slot_idx = self._client_slots.get(client_id)
         if slot_idx is None:
@@ -1367,7 +1386,7 @@ class DasdInferenceController:
         else:
             self._remove_request_slot(
                 slot_idx=slot_idx,
-                reason="new_state_request_or_epoch_switch",
+                reason="new_request_switch",
                 client_id=client_id,
                 request_id=request_id,
                 epoch=epoch,

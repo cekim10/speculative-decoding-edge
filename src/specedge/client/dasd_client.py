@@ -35,42 +35,50 @@ class DasdCreditController:
     def apply_feedback(self, accepted_len: int, proposed_len: int):
         credit_before = self.credit
         rejected_len = max(0, proposed_len - accepted_len)
-
-        if not self.adaptive_enabled:
-            return {
-                "credit_before": credit_before,
-                "credit_after": self.credit,
-                "accepted_len": accepted_len,
-                "proposed_len": proposed_len,
-                "rejected_len": rejected_len,
-                "strong_accept_streak": self.strong_accept_streak,
-                "full_rejection_streak": self.full_rejection_streak,
-            }
-
-        self.credit += accepted_len - rejected_len
+        raw_delta = accepted_len - rejected_len
+        streak_before = {
+            "strong_accept_streak": self.strong_accept_streak,
+            "full_rejection_streak": self.full_rejection_streak,
+        }
 
         if proposed_len > 0 and accepted_len == proposed_len:
             self.strong_accept_streak += 1
             self.full_rejection_streak = 0
-            self.credit += self.success_bonus
-            if self.strong_accept_streak >= 2 and self.success_bonus > 0:
-                self.credit += 1
         elif accepted_len == 0 and proposed_len > 0:
             self.full_rejection_streak += 1
             self.strong_accept_streak = 0
-            self.credit -= self.rejection_penalty
         else:
             self.strong_accept_streak = 0
             self.full_rejection_streak = 0
 
-        self.credit = max(self.credit_min, min(self.credit_max, self.credit))
+        unclamped_credit = self.credit
+
+        if self.adaptive_enabled:
+            unclamped_credit += raw_delta
+
+            if proposed_len > 0 and accepted_len == proposed_len:
+                unclamped_credit += self.success_bonus
+                if self.strong_accept_streak >= 2 and self.success_bonus > 0:
+                    unclamped_credit += 1
+            elif accepted_len == 0 and proposed_len > 0:
+                unclamped_credit -= self.rejection_penalty
+
+            self.credit = max(self.credit_min, min(self.credit_max, unclamped_credit))
+        else:
+            unclamped_credit = self.credit
 
         return {
+            "adaptive_enabled": self.adaptive_enabled,
             "credit_before": credit_before,
             "credit_after": self.credit,
+            "raw_delta": raw_delta,
+            "unclamped_credit": unclamped_credit,
+            "clamped_credit": self.credit,
             "accepted_len": accepted_len,
             "proposed_len": proposed_len,
             "rejected_len": rejected_len,
+            "strong_accept_streak_before": streak_before["strong_accept_streak"],
+            "full_rejection_streak_before": streak_before["full_rejection_streak"],
             "strong_accept_streak": self.strong_accept_streak,
             "full_rejection_streak": self.full_rejection_streak,
         }

@@ -349,23 +349,56 @@ class SpecExecClient:
             fallback_max_branch_width=self._fixed_max_branch_width,
         )
 
+        if feedback is not None:
+            feedback["window_mapping"] = {
+                "adaptive_window_enabled": (
+                    config.dasd_adaptive_credit_enabled
+                    and config.dasd_adaptive_window_enabled
+                ),
+                "credit": state.credit_controller.credit,
+                "min_window": config.dasd_min_window,
+                "max_window": config.dasd_max_window,
+                "chosen_window": state.window_size,
+                "server_next_credit": next_credit,
+            }
+            feedback["tree_mapping"] = {
+                "adaptive_tree_budget_enabled": (
+                    config.dasd_adaptive_credit_enabled
+                    and config.dasd_adaptive_tree_budget_enabled
+                ),
+                "credit": state.credit_controller.credit,
+                "min_tree_depth": config.dasd_min_tree_depth,
+                "max_tree_depth": config.dasd_max_tree_depth,
+                "min_leaf_budget": config.dasd_min_leaf_budget,
+                "max_leaf_budget": config.dasd_max_leaf_budget,
+                "chosen_tree_budget": state.tree_budget,
+            }
+
         if config.dasd_debug:
             self._logger.info(
-                "[DASD] credit_control req=%s epoch=%d reason=%s credit_before=%s credit_after=%s accepted=%s proposed=%s rejected=%s strong_accept_streak=%s full_rejection_streak=%s W_before=%s W_after=%s tree_before=%s tree_after=%s",
+                "[DASD] credit_control req=%s epoch=%d reason=%s adaptive=%s credit_before=%s raw_delta=%s unclamped=%s clamped=%s credit_after=%s accepted=%s proposed=%s rejected=%s strong_accept_streak=%s->%s full_rejection_streak=%s->%s W_before=%s W_after=%s window_mapping=%s tree_before=%s tree_after=%s tree_mapping=%s",
                 state.request_id,
                 state.epoch,
                 reason,
+                feedback.get("adaptive_enabled") if feedback is not None else None,
                 feedback.get("credit_before") if feedback is not None else state.credit_controller.credit,
+                feedback.get("raw_delta") if feedback is not None else None,
+                feedback.get("unclamped_credit") if feedback is not None else None,
+                feedback.get("clamped_credit") if feedback is not None else None,
                 feedback.get("credit_after") if feedback is not None else state.credit_controller.credit,
                 feedback.get("accepted_len") if feedback is not None else None,
                 feedback.get("proposed_len") if feedback is not None else None,
                 feedback.get("rejected_len") if feedback is not None else None,
+                feedback.get("strong_accept_streak_before") if feedback is not None else None,
                 feedback.get("strong_accept_streak") if feedback is not None else None,
+                feedback.get("full_rejection_streak_before") if feedback is not None else None,
                 feedback.get("full_rejection_streak") if feedback is not None else None,
                 previous_window,
                 state.window_size,
+                feedback.get("window_mapping") if feedback is not None else None,
                 previous_tree_budget,
                 state.tree_budget,
+                feedback.get("tree_mapping") if feedback is not None else None,
             )
 
     @contextmanager

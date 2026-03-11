@@ -142,6 +142,9 @@ class SpecEdgeClientConfig(metaclass=_ConfigMeta):
         cls.dasd_max_spec_buffer_tokens = int(
             os.getenv("SPECEDGE_DASD_MAX_SPEC_BUFFER_TOKENS", "256")
         )
+        cls.dasd_abort_after_failures = int(
+            os.getenv("SPECEDGE_DASD_ABORT_AFTER_FAILURES", "4")
+        )
         cls.dasd_debug = os.getenv("SPECEDGE_DASD_DEBUG", "False") == "True"
 
         cls._initialized = True

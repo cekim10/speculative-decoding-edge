@@ -888,6 +888,7 @@ class DasdInferenceController:
         self._client_slots: dict[str, int] = {}
         self._client_epochs: dict[str, int] = {}
         self._slot_states: dict[str, DasdVerifierState] = {}
+        self._terminal_failed_requests: dict[tuple[str, str, int], str] = {}
         self._slot_cap = max(1, self._num_clients)
         self._available_slots = list(range(self._slot_cap))
         self._cuda_poisoned = False
@@ -912,6 +913,10 @@ class DasdInferenceController:
             try:
                 accept_bitmap, accepted_len, r_obs = self._verify_bundle(request)
             except Exception as e:
+                self._mark_terminal_failed_request(
+                    request,
+                    reason=f"{type(e).__name__}:{e}",
+                )
                 if self._is_fatal_cuda_exception(e):
                     self._cuda_poisoned = True
                     state = self._slot_states.get(request.client_id)
@@ -961,6 +966,25 @@ class DasdInferenceController:
             return self._recv_queue.qsize()
         except (NotImplementedError, OSError):
             return -1
+
+    def _terminal_request_key(self, request: specedge_pb2.VerifyBundleRequest):
+        return (request.client_id, request.request_id, int(request.epoch))
+
+    def _mark_terminal_failed_request(self, request, reason: str):
+        key = self._terminal_request_key(request)
+        self._terminal_failed_requests[key] = reason
+        self._logger.warning(
+            "Marking DASD request terminal-failed client=%s request=%s epoch=%s reason=%s",
+            request.client_id,
+            request.request_id,
+            request.epoch,
+            reason,
+        )
+        self._dasd_debug_log(
+            "terminal_failed_request",
+            request=request,
+            reason=reason,
+        )
 
     def _is_fatal_cuda_exception(self, exc: Exception):
         message = f"{type(exc).__name__}: {exc}".lower()
@@ -1119,6 +1143,16 @@ class DasdInferenceController:
     def _verify_bundle(self, request: specedge_pb2.VerifyBundleRequest):
         token_window = [int(token_id) for token_id in request.token_ids]
         self._dasd_debug_log("verify_start", request=request, token_window=token_window)
+
+        terminal_reason = self._terminal_failed_requests.get(
+            self._terminal_request_key(request)
+        )
+        if terminal_reason is not None:
+            return self._safe_reject_bundle(
+                request,
+                token_window,
+                reason=f"terminal_failed:{terminal_reason}",
+            )
 
         current_epoch = self._client_epochs.get(request.client_id, -1)
         if request.epoch < current_epoch:

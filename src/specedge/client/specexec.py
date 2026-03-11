@@ -194,12 +194,14 @@ class SpecExecClient:
         self._draft_more_for_dasd(state, initial_target)
 
         eos_flag = False
-        while state.committed_len < self._max_new_tokens and not eos_flag:
+        while state.committed_len < self._max_new_tokens and not eos_flag and not state.aborted:
             await self._fill_inflight_for_dasd(state)
             if not state.inflight:
-                self._logger.warning(
-                    "No inflight DASD bundle for req_idx=%d; stopping generation.", req_idx
-                )
+                if not state.aborted:
+                    self._logger.warning(
+                        "No inflight DASD bundle for req_idx=%d; stopping generation.",
+                        req_idx,
+                    )
                 break
 
             await self._receive_one_round_for_dasd(state)
@@ -221,14 +223,7 @@ class SpecExecClient:
             ):
                 eos_flag = True
 
-        if state.inflight:
-            pending_tasks = [info.task for info in state.inflight.values()]
-            for task in pending_tasks:
-                task.cancel()
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
-            state.inflight.clear()
-            state.task_to_bundle.clear()
-            state.responses_by_base.clear()
+        await self._drain_dasd_inflight(state)
 
         final_generated = state.drafted_tokens[: state.committed_len]
         if final_generated:
@@ -260,6 +255,8 @@ class SpecExecClient:
                 "goodput": goodput,
                 "rollbacks_count": state.rollbacks_count,
                 "total_latency_ms": total_latency_ms,
+                "aborted": state.aborted,
+                "abort_reason": state.abort_reason,
                 "mode": "dasd",
             }
         )
@@ -271,6 +268,8 @@ class SpecExecClient:
         )
 
     async def _fill_inflight_for_dasd(self, state: DasdRequestState):
+        if state.aborted:
+            return
         while len(state.inflight) < config.dasd_max_inflight_bundles:
             required_end = state.next_base_index + state.window_size
             if required_end > len(state.drafted_tokens):
@@ -297,6 +296,8 @@ class SpecExecClient:
             await self._send_bundle_for_dasd(state)
 
     async def _send_bundle_for_dasd(self, state: DasdRequestState):
+        if state.aborted:
+            return
         bundle_id = state.next_bundle_id
         base_token_index = state.next_base_index
         token_ids = state.drafted_tokens[
@@ -343,7 +344,7 @@ class SpecExecClient:
             )
 
     async def _receive_one_round_for_dasd(self, state: DasdRequestState):
-        if not state.inflight:
+        if state.aborted or not state.inflight:
             return
 
         wait_tasks = list(state.task_to_bundle.keys())
@@ -363,13 +364,24 @@ class SpecExecClient:
 
             try:
                 response = task.result()
+                state.consecutive_rpc_failures = 0
             except Exception:
+                state.consecutive_rpc_failures += 1
                 self._logger.exception(
                     "DASD bundle task failed (req=%s, bundle=%d, base=%d). Treating as full rejection.",
                     state.request_id,
                     bundle_id,
                     task_info.base_token_index,
                 )
+                if state.consecutive_rpc_failures >= config.dasd_abort_after_failures:
+                    await self._abort_dasd_request(
+                        state,
+                        reason=(
+                            "rpc_failures>="
+                            f"{config.dasd_abort_after_failures}"
+                        ),
+                    )
+                    return
                 response = SimpleNamespace(
                     bundle_id=bundle_id,
                     accepted_len=0,
@@ -416,6 +428,10 @@ class SpecExecClient:
             state.total_accepted_tokens += accepted_len
             state.committed_len += accepted_len
             assert state.committed_len >= prev_committed
+            if accepted_len == 0:
+                state.consecutive_full_rejections += 1
+            else:
+                state.consecutive_full_rejections = 0
             if config.dasd_debug:
                 self._logger.info(
                     "[DASD] commit req=%s bundle=%d accepted=%d/%d committed=%d",
@@ -450,6 +466,23 @@ class SpecExecClient:
                 }
             )
 
+            if (
+                accepted_len == 0
+                and state.consecutive_full_rejections
+                >= config.dasd_abort_after_failures
+            ):
+                abort_reason = (
+                    "full_rejections>="
+                    f"{config.dasd_abort_after_failures}"
+                )
+                state.aborted = True
+                state.abort_reason = abort_reason
+                abort_task = asyncio.create_task(
+                    self._abort_dasd_request(state, reason=abort_reason)
+                )
+                abort_task.add_done_callback(lambda _: None)
+                return
+
             if accepted_len < verified_len:
                 state.rollbacks_count += 1
                 state.epoch += 1
@@ -481,6 +514,34 @@ class SpecExecClient:
 
         if state.next_base_index < state.committed_len:
             state.next_base_index = state.committed_len
+
+    async def _drain_dasd_inflight(self, state: DasdRequestState):
+        if not state.inflight:
+            return
+
+        pending_tasks = [info.task for info in state.inflight.values()]
+        for task in pending_tasks:
+            task.cancel()
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+        state.inflight.clear()
+        state.task_to_bundle.clear()
+        state.responses_by_base.clear()
+
+    async def _abort_dasd_request(self, state: DasdRequestState, reason: str):
+        if state.aborted and not state.inflight:
+            return
+        state.aborted = True
+        if state.abort_reason == "":
+            state.abort_reason = reason
+        self._logger.warning(
+            "Aborting DASD request req=%s reason=%s committed=%d verified=%d accepted=%d",
+            state.request_id,
+            state.abort_reason,
+            state.committed_len,
+            state.total_verified_tokens,
+            state.total_accepted_tokens,
+        )
+        await self._drain_dasd_inflight(state)
 
     def _draft_more_for_dasd(self, state: DasdRequestState, target_tokens: int):
         if target_tokens <= 0:

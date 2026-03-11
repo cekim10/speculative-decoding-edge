@@ -57,7 +57,12 @@ async def main():
         stub = specedge_pb2_grpc.SpecEdgeServiceStub(channel)
         _ = stub.Sync(specedge_pb2.SyncRequest())
 
-    logger.info("Starting %s requests", config.max_request_num)
+    logger.info(
+        "Starting %s requests (max_request_num=%s, sample_req_cnt=%s)",
+        len(req_indices),
+        config.max_request_num,
+        config.sample_req_cnt,
+    )
     for i, req_idx in enumerate(req_indices):
         logger.info("Request %s/%s, req_idx: %s", i + 1, len(req_indices), req_idx)
         await generate(

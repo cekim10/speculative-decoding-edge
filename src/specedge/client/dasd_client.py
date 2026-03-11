@@ -35,6 +35,10 @@ class DasdRequestState:
     total_verified_tokens: int = 0
     total_accepted_tokens: int = 0
     rollbacks_count: int = 0
+    consecutive_full_rejections: int = 0
+    consecutive_rpc_failures: int = 0
+    aborted: bool = False
+    abort_reason: str = ""
 
     def speculative_tokens(self):
         return max(0, len(self.drafted_tokens) - self.committed_len)

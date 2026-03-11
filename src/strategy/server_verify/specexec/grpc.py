@@ -1208,7 +1208,11 @@ class DasdInferenceController:
                     accept_bitmap.extend([False] * (len(token_window) - idx - 1))
                 break
 
-            self._advance_state(state, token_id)
+            self._advance_state(
+                state=state,
+                token_id=token_id,
+                bundle_id=int(request.bundle_id),
+            )
             accepted_len += 1
 
         r_obs = accepted_len / len(token_window) if len(token_window) > 0 else 0.0
@@ -1314,6 +1318,7 @@ class DasdInferenceController:
             position=len(prompt_tokens) - 1,
             client_id=client_id,
             request_id=request_id,
+            bundle_id=bundle_id,
             epoch=epoch,
             prompt_len=len(prompt_tokens),
             committed_tokens_len=len(prompt_tokens),
@@ -1400,7 +1405,7 @@ class DasdInferenceController:
             attention_mask=prefill_attention_mask,
         )
 
-    def _advance_state(self, state: DasdVerifierState, token_id: int):
+    def _advance_state(self, state: DasdVerifierState, token_id: int, bundle_id: int):
         position = len(state.committed_tokens)
         next_token_id = self._predict_next_token(
             slot_idx=state.slot_idx,
@@ -1408,6 +1413,7 @@ class DasdInferenceController:
             position=position,
             client_id=state.client_id,
             request_id=state.request_id,
+            bundle_id=bundle_id,
             epoch=state.epoch,
             prompt_len=state.prompt_len,
             committed_tokens_len=len(state.committed_tokens) + 1,
@@ -1423,6 +1429,7 @@ class DasdInferenceController:
         position: int,
         client_id: str,
         request_id: str,
+        bundle_id: int,
         epoch: int,
         prompt_len: int,
         committed_tokens_len: int,
@@ -1450,15 +1457,22 @@ class DasdInferenceController:
                 "predict_shape_invalid",
                 client_id=client_id,
                 request_id=request_id,
+                bundle_id=bundle_id,
                 epoch=epoch,
                 slot_idx=slot_idx,
                 prompt_len=prompt_len,
                 committed_tokens_len=committed_tokens_len,
                 input_shape=tuple(input_ids.shape),
+                input_len=input_ids.size(-1),
+                attention_mask_shape=tuple(attention_mask.shape),
                 position_shape=tuple(position_ids.shape),
+                position_len=position_ids.size(-1),
+                cache_batch_indices_shape=tuple(cache_batch_indices.shape),
                 cache_batch_indices=cache_batch_indices.tolist(),
+                cache_seq_indices_shape=tuple(cache_seq_indices.shape),
                 cache_seq_indices=cache_seq_indices.tolist(),
                 decode_tokens=input_ids.numel(),
+                single_token_prediction=True,
                 phase=phase,
             )
             raise RuntimeError(
@@ -1469,15 +1483,22 @@ class DasdInferenceController:
             "predict_step",
             client_id=client_id,
             request_id=request_id,
+            bundle_id=bundle_id,
             epoch=epoch,
             slot_idx=slot_idx,
             prompt_len=prompt_len,
             committed_tokens_len=committed_tokens_len,
             input_shape=tuple(input_ids.shape),
+            input_len=input_ids.size(-1),
+            attention_mask_shape=tuple(attention_mask.shape),
             position_shape=tuple(position_ids.shape),
+            position_len=position_ids.size(-1),
+            cache_batch_indices_shape=tuple(cache_batch_indices.shape),
             cache_batch_indices=cache_batch_indices.tolist(),
+            cache_seq_indices_shape=tuple(cache_seq_indices.shape),
             cache_seq_indices=cache_seq_indices.tolist(),
             decode_tokens=input_ids.numel(),
+            single_token_prediction=True,
             phase=phase,
         )
 

@@ -38,6 +38,7 @@ message VerifyBundleRequest {
     repeated int32 token_ids = 7;
     int64 timestamp_send_ms = 8;
     string draft_model_id = 9;
+    int32 epoch = 10;
 }
 
 message VerifyBundleResponse {

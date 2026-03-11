@@ -33,9 +33,11 @@ class DasdClientControlState:
 class DasdVerifierState:
     slot_idx: int
     request_id: str
+    epoch: int
     prompt_len: int
     committed_tokens: list[int]
     next_token_id: int
+    cleanup_safe: bool = True
 
 
 class SpecExecBatchServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
@@ -883,9 +885,11 @@ class DasdInferenceController:
                 self._vocab_size = None
 
         self._client_slots: dict[str, int] = {}
+        self._client_epochs: dict[str, int] = {}
         self._slot_states: dict[str, DasdVerifierState] = {}
         self._slot_cap = max(1, self._num_clients)
         self._available_slots = list(range(self._slot_cap))
+        self._cuda_poisoned = False
 
     def loop(self):
         self._logger.debug("Starting DASD inference loop")
@@ -907,10 +911,26 @@ class DasdInferenceController:
             try:
                 accept_bitmap, accepted_len, r_obs = self._verify_bundle(request)
             except Exception as e:
-                self._invalidate_client_state(
-                    client_id=request.client_id,
-                    reason=f"verification_exception:{type(e).__name__}",
-                )
+                if self._is_fatal_cuda_exception(e):
+                    self._cuda_poisoned = True
+                    state = self._slot_states.get(request.client_id)
+                    if state is not None:
+                        state.cleanup_safe = False
+                        self._client_epochs[request.client_id] = max(
+                            self._client_epochs.get(request.client_id, state.epoch),
+                            state.epoch,
+                        )
+                    self._dasd_debug_log(
+                        "cuda_poisoned",
+                        request=request,
+                        state=state,
+                        reason=type(e).__name__,
+                    )
+                else:
+                    self._invalidate_client_state(
+                        client_id=request.client_id,
+                        reason=f"verification_exception:{type(e).__name__}",
+                    )
                 self._logger.exception(
                     "DASD verification failed for client=%s request=%s bundle=%s: %s",
                     request.client_id,
@@ -941,6 +961,10 @@ class DasdInferenceController:
         except (NotImplementedError, OSError):
             return -1
 
+    def _is_fatal_cuda_exception(self, exc: Exception):
+        message = f"{type(exc).__name__}: {exc}".lower()
+        return "cuda" in message or "device-side assert" in message or "acceleratorerror" in message
+
     def _dasd_debug_log(
         self,
         event: str,
@@ -958,10 +982,12 @@ class DasdInferenceController:
         generated_committed_len = None
         prompt_len = None
         slot_idx = None
+        state_epoch = None
         if state is not None:
             generated_committed_len = len(state.committed_tokens) - state.prompt_len
             prompt_len = state.prompt_len
             slot_idx = state.slot_idx
+            state_epoch = state.epoch
 
         window_len = len(token_window) if token_window is not None else 0
         token_min = min(token_window) if token_window else None
@@ -969,13 +995,15 @@ class DasdInferenceController:
 
         self._logger.info(
             "DASD_DEBUG event=%s client_id=%s request_id=%s bundle_id=%s slot_idx=%s "
-            "base_token_index=%s generated_committed_len=%s prompt_len=%s "
+            "epoch=%s state_epoch=%s base_token_index=%s generated_committed_len=%s prompt_len=%s "
             "window_len=%d token_min=%s token_max=%s %s",
             event,
             request.client_id if request is not None else extra.get("client_id"),
             request.request_id if request is not None else extra.get("request_id"),
             request.bundle_id if request is not None else extra.get("bundle_id"),
             slot_idx if slot_idx is not None else extra.get("slot_idx"),
+            request.epoch if request is not None else extra.get("epoch"),
+            state_epoch if state_epoch is not None else extra.get("state_epoch"),
             request.base_token_index if request is not None else extra.get("base_token_index"),
             generated_committed_len,
             prompt_len,
@@ -1021,6 +1049,11 @@ class DasdInferenceController:
     def _invalidate_client_state(self, client_id: str, reason: str):
         state = self._slot_states.pop(client_id, None)
         slot_idx = self._client_slots.get(client_id)
+        if state is not None:
+            self._client_epochs[client_id] = max(
+                self._client_epochs.get(client_id, state.epoch),
+                state.epoch,
+            )
         self._logger.warning(
             "Invalidating DASD state for client=%s slot_idx=%s reason=%s",
             client_id,
@@ -1032,6 +1065,7 @@ class DasdInferenceController:
             client_id=client_id,
             request_id=state.request_id if state is not None else None,
             slot_idx=slot_idx if state is None else state.slot_idx,
+            epoch=state.epoch if state is not None else self._client_epochs.get(client_id),
             prompt_len=state.prompt_len if state is not None else None,
             reason=reason,
         )
@@ -1042,14 +1076,27 @@ class DasdInferenceController:
         reason: str,
         client_id: str,
         request_id: str,
+        epoch: int,
         bundle_id: int | None = None,
     ):
+        if self._cuda_poisoned:
+            self._dasd_debug_log(
+                "remove_requests_skipped_cuda_poisoned",
+                client_id=client_id,
+                request_id=request_id,
+                bundle_id=bundle_id,
+                slot_idx=slot_idx,
+                epoch=epoch,
+                reason=reason,
+            )
+            return
         self._dasd_debug_log(
             "remove_requests_before",
             client_id=client_id,
             request_id=request_id,
             bundle_id=bundle_id,
             slot_idx=slot_idx,
+            epoch=epoch,
             reason=reason,
         )
         self._engine.remove_requests(torch.tensor([slot_idx], device=self._device))
@@ -1059,12 +1106,27 @@ class DasdInferenceController:
             request_id=request_id,
             bundle_id=bundle_id,
             slot_idx=slot_idx,
+            epoch=epoch,
             reason=reason,
         )
 
     def _verify_bundle(self, request: specedge_pb2.VerifyBundleRequest):
         token_window = [int(token_id) for token_id in request.token_ids]
         self._dasd_debug_log("verify_start", request=request, token_window=token_window)
+
+        current_epoch = self._client_epochs.get(request.client_id, -1)
+        if request.epoch < current_epoch:
+            return self._safe_reject_bundle(
+                request,
+                token_window,
+                reason=f"stale_epoch(request={request.epoch}, current={current_epoch})",
+            )
+        if self._cuda_poisoned:
+            return self._safe_reject_bundle(
+                request,
+                token_window,
+                reason="cuda_poisoned",
+            )
 
         if any(token_id < 0 for token_id in token_window):
             return self._safe_reject_bundle(
@@ -1086,8 +1148,10 @@ class DasdInferenceController:
         state = self._ensure_client_state(
             client_id=request.client_id,
             request_id=request.request_id,
+            epoch=int(request.epoch),
             bundle_id=int(request.bundle_id),
         )
+        self._client_epochs[request.client_id] = state.epoch
         if not self._is_valid_slot_idx(state.slot_idx):
             return self._safe_reject_bundle(
                 request,
@@ -1112,9 +1176,10 @@ class DasdInferenceController:
         generated_committed_len = len(state.committed_tokens) - state.prompt_len
         if request.base_token_index != generated_committed_len:
             self._logger.debug(
-                "Bundle base mismatch for client=%s request=%s bundle=%s (base=%d, committed_generated=%d)",
+                "Bundle base mismatch for client=%s request=%s epoch=%d bundle=%s (base=%d, committed_generated=%d)",
                 request.client_id,
                 request.request_id,
+                request.epoch,
                 request.bundle_id,
                 request.base_token_index,
                 generated_committed_len,
@@ -1151,18 +1216,31 @@ class DasdInferenceController:
         )
         return accept_bitmap, accepted_len, r_obs
 
-    def _ensure_client_state(self, client_id: str, request_id: str, bundle_id: int):
+    def _ensure_client_state(
+        self, client_id: str, request_id: str, epoch: int, bundle_id: int
+    ):
         state = self._slot_states.get(client_id)
-        if state is not None and state.request_id == request_id:
+        if (
+            state is not None
+            and state.request_id == request_id
+            and state.epoch == epoch
+        ):
             self._dasd_debug_log(
                 "state_reuse",
                 client_id=client_id,
                 request_id=request_id,
                 bundle_id=bundle_id,
+                epoch=epoch,
                 state=state,
                 new_state=False,
             )
             return state
+
+        previous_epoch = self._client_epochs.get(client_id, -1)
+        if epoch < previous_epoch:
+            raise RuntimeError(
+                f"stale epoch for client {client_id}: request epoch {epoch} < current {previous_epoch}"
+            )
 
         slot_idx = self._client_slots.get(client_id)
         if slot_idx is None:
@@ -1179,6 +1257,7 @@ class DasdInferenceController:
                 request_id=request_id,
                 bundle_id=bundle_id,
                 slot_idx=slot_idx,
+                epoch=epoch,
                 new_state=True,
                 reused_slot=False,
             )
@@ -1188,23 +1267,37 @@ class DasdInferenceController:
             )
         else:
             self._dasd_debug_log(
-                "reuse_slot_for_new_request",
+                "epoch_or_request_transition",
                 client_id=client_id,
                 request_id=request_id,
                 bundle_id=bundle_id,
                 slot_idx=slot_idx,
+                epoch=epoch,
+                state_epoch=state.epoch if state is not None else previous_epoch,
                 prev_request_id=state.request_id if state is not None else None,
                 new_state=True,
                 reused_slot=True,
             )
 
-        self._remove_request_slot(
-            slot_idx=slot_idx,
-            reason="new_state_or_request_switch",
-            client_id=client_id,
-            request_id=request_id,
-            bundle_id=bundle_id,
-        )
+        if state is not None and not state.cleanup_safe:
+            self._dasd_debug_log(
+                "remove_requests_skipped_unsafe_cleanup",
+                client_id=client_id,
+                request_id=request_id,
+                bundle_id=bundle_id,
+                slot_idx=slot_idx,
+                epoch=epoch,
+                state_epoch=state.epoch,
+            )
+        else:
+            self._remove_request_slot(
+                slot_idx=slot_idx,
+                reason="new_state_request_or_epoch_switch",
+                client_id=client_id,
+                request_id=request_id,
+                epoch=epoch,
+                bundle_id=bundle_id,
+            )
 
         prompt_tokens = self._load_prompt_tokens(request_id)
         self._prime_state_from_prompt(slot_idx, prompt_tokens)
@@ -1217,16 +1310,19 @@ class DasdInferenceController:
         state = DasdVerifierState(
             slot_idx=slot_idx,
             request_id=request_id,
+            epoch=epoch,
             prompt_len=len(prompt_tokens),
             committed_tokens=prompt_tokens,
             next_token_id=next_token_id,
         )
         self._slot_states[client_id] = state
+        self._client_epochs[client_id] = epoch
         self._dasd_debug_log(
             "state_created",
             client_id=client_id,
             request_id=request_id,
             bundle_id=bundle_id,
+            epoch=epoch,
             state=state,
             token_window=[],
             new_state=True,

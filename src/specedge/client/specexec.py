@@ -311,6 +311,7 @@ class SpecExecClient:
                 client_id=self._dasd_client_id,
                 request_id=state.request_id,
                 bundle_id=bundle_id,
+                epoch=state.epoch,
                 base_token_index=base_token_index,
                 token_ids=token_ids,
                 timestamp_send_ms=int(time.time() * 1000),

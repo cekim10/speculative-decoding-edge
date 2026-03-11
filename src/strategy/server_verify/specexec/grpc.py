@@ -874,6 +874,13 @@ class DasdInferenceController:
         )
         self._tokenizer = util.load_tokenizer(config.target_model)
         self._dataset = util.load_dataset(config.dataset, config.target_model)
+        self._dasd_debug = getattr(config, "dasd_debug", False)
+        self._vocab_size = getattr(self._tokenizer, "vocab_size", None)
+        if self._vocab_size is None:
+            try:
+                self._vocab_size = len(self._tokenizer)
+            except TypeError:
+                self._vocab_size = None
 
         self._client_slots: dict[str, int] = {}
         self._slot_states: dict[str, DasdVerifierState] = {}
@@ -900,6 +907,10 @@ class DasdInferenceController:
             try:
                 accept_bitmap, accepted_len, r_obs = self._verify_bundle(request)
             except Exception as e:
+                self._invalidate_client_state(
+                    client_id=request.client_id,
+                    reason=f"verification_exception:{type(e).__name__}",
+                )
                 self._logger.exception(
                     "DASD verification failed for client=%s request=%s bundle=%s: %s",
                     request.client_id,
@@ -930,12 +941,173 @@ class DasdInferenceController:
         except (NotImplementedError, OSError):
             return -1
 
+    def _dasd_debug_log(
+        self,
+        event: str,
+        request: specedge_pb2.VerifyBundleRequest | None = None,
+        state: DasdVerifierState | None = None,
+        token_window: list[int] | None = None,
+        **extra,
+    ):
+        if not self._dasd_debug:
+            return
+
+        if token_window is None and request is not None:
+            token_window = [int(token_id) for token_id in request.token_ids]
+
+        generated_committed_len = None
+        prompt_len = None
+        slot_idx = None
+        if state is not None:
+            generated_committed_len = len(state.committed_tokens) - state.prompt_len
+            prompt_len = state.prompt_len
+            slot_idx = state.slot_idx
+
+        window_len = len(token_window) if token_window is not None else 0
+        token_min = min(token_window) if token_window else None
+        token_max = max(token_window) if token_window else None
+
+        self._logger.info(
+            "DASD_DEBUG event=%s client_id=%s request_id=%s bundle_id=%s slot_idx=%s "
+            "base_token_index=%s generated_committed_len=%s prompt_len=%s "
+            "window_len=%d token_min=%s token_max=%s %s",
+            event,
+            request.client_id if request is not None else extra.get("client_id"),
+            request.request_id if request is not None else extra.get("request_id"),
+            request.bundle_id if request is not None else extra.get("bundle_id"),
+            slot_idx if slot_idx is not None else extra.get("slot_idx"),
+            request.base_token_index if request is not None else extra.get("base_token_index"),
+            generated_committed_len,
+            prompt_len,
+            window_len,
+            token_min,
+            token_max,
+            " ".join(f"{key}={value}" for key, value in extra.items()),
+        )
+
+    def _safe_reject_bundle(
+        self,
+        request: specedge_pb2.VerifyBundleRequest,
+        token_window: list[int],
+        reason: str,
+        state: DasdVerifierState | None = None,
+        reset_state: bool = False,
+    ):
+        self._logger.warning(
+            "Rejecting DASD bundle client=%s request=%s bundle=%s reason=%s",
+            request.client_id,
+            request.request_id,
+            request.bundle_id,
+            reason,
+        )
+        self._dasd_debug_log(
+            "reject_bundle",
+            request=request,
+            state=state,
+            token_window=token_window,
+            reason=reason,
+            reset_state=reset_state,
+        )
+        if reset_state:
+            self._invalidate_client_state(
+                client_id=request.client_id,
+                reason=reason,
+            )
+        return ([False] * len(token_window), 0, 0.0)
+
+    def _is_valid_slot_idx(self, slot_idx: int):
+        return 0 <= slot_idx < self._slot_cap
+
+    def _invalidate_client_state(self, client_id: str, reason: str):
+        state = self._slot_states.pop(client_id, None)
+        slot_idx = self._client_slots.get(client_id)
+        self._logger.warning(
+            "Invalidating DASD state for client=%s slot_idx=%s reason=%s",
+            client_id,
+            slot_idx if state is None else state.slot_idx,
+            reason,
+        )
+        self._dasd_debug_log(
+            "invalidate_state",
+            client_id=client_id,
+            request_id=state.request_id if state is not None else None,
+            slot_idx=slot_idx if state is None else state.slot_idx,
+            prompt_len=state.prompt_len if state is not None else None,
+            reason=reason,
+        )
+
+    def _remove_request_slot(
+        self,
+        slot_idx: int,
+        reason: str,
+        client_id: str,
+        request_id: str,
+        bundle_id: int | None = None,
+    ):
+        self._dasd_debug_log(
+            "remove_requests_before",
+            client_id=client_id,
+            request_id=request_id,
+            bundle_id=bundle_id,
+            slot_idx=slot_idx,
+            reason=reason,
+        )
+        self._engine.remove_requests(torch.tensor([slot_idx], device=self._device))
+        self._dasd_debug_log(
+            "remove_requests_after",
+            client_id=client_id,
+            request_id=request_id,
+            bundle_id=bundle_id,
+            slot_idx=slot_idx,
+            reason=reason,
+        )
+
     def _verify_bundle(self, request: specedge_pb2.VerifyBundleRequest):
+        token_window = [int(token_id) for token_id in request.token_ids]
+        self._dasd_debug_log("verify_start", request=request, token_window=token_window)
+
+        if any(token_id < 0 for token_id in token_window):
+            return self._safe_reject_bundle(
+                request,
+                token_window,
+                reason="negative_token_id",
+                reset_state=True,
+            )
+        if self._vocab_size is not None and any(
+            token_id >= self._vocab_size for token_id in token_window
+        ):
+            return self._safe_reject_bundle(
+                request,
+                token_window,
+                reason=f"token_id_out_of_vocab(vocab_size={self._vocab_size})",
+                reset_state=True,
+            )
+
         state = self._ensure_client_state(
             client_id=request.client_id,
             request_id=request.request_id,
+            bundle_id=int(request.bundle_id),
         )
-        token_window = [int(token_id) for token_id in request.token_ids]
+        if not self._is_valid_slot_idx(state.slot_idx):
+            return self._safe_reject_bundle(
+                request,
+                token_window,
+                reason=f"invalid_slot_idx({state.slot_idx})",
+                state=state,
+                reset_state=True,
+            )
+        if state.prompt_len > len(state.committed_tokens):
+            return self._safe_reject_bundle(
+                request,
+                token_window,
+                reason=(
+                    "state_corruption(prompt_len=%d committed_tokens=%d)"
+                    % (state.prompt_len, len(state.committed_tokens))
+                ),
+                state=state,
+                reset_state=True,
+            )
+        self._dasd_debug_log("verify_state_ready", request=request, state=state, token_window=token_window)
 
         generated_committed_len = len(state.committed_tokens) - state.prompt_len
         if request.base_token_index != generated_committed_len:
@@ -946,6 +1118,12 @@ class DasdInferenceController:
                 request.bundle_id,
                 request.base_token_index,
                 generated_committed_len,
+            )
+            self._dasd_debug_log(
+                "base_mismatch",
+                request=request,
+                state=state,
+                token_window=token_window,
             )
             return ([False] * len(token_window), 0, 0.0)
 
@@ -963,11 +1141,27 @@ class DasdInferenceController:
             accepted_len += 1
 
         r_obs = accepted_len / len(token_window) if len(token_window) > 0 else 0.0
+        self._dasd_debug_log(
+            "verify_done",
+            request=request,
+            state=state,
+            token_window=token_window,
+            accepted_len=accepted_len,
+            r_obs=f"{r_obs:.4f}",
+        )
         return accept_bitmap, accepted_len, r_obs
 
-    def _ensure_client_state(self, client_id: str, request_id: str):
+    def _ensure_client_state(self, client_id: str, request_id: str, bundle_id: int):
         state = self._slot_states.get(client_id)
         if state is not None and state.request_id == request_id:
+            self._dasd_debug_log(
+                "state_reuse",
+                client_id=client_id,
+                request_id=request_id,
+                bundle_id=bundle_id,
+                state=state,
+                new_state=False,
+            )
             return state
 
         slot_idx = self._client_slots.get(client_id)
@@ -979,8 +1173,38 @@ class DasdInferenceController:
                 )
             slot_idx = self._available_slots.pop(0)
             self._client_slots[client_id] = slot_idx
+            self._dasd_debug_log(
+                "assign_slot",
+                client_id=client_id,
+                request_id=request_id,
+                bundle_id=bundle_id,
+                slot_idx=slot_idx,
+                new_state=True,
+                reused_slot=False,
+            )
+        elif not self._is_valid_slot_idx(slot_idx):
+            raise RuntimeError(
+                f"DASD slot index {slot_idx} for client {client_id} is outside [0, {self._slot_cap - 1}]"
+            )
+        else:
+            self._dasd_debug_log(
+                "reuse_slot_for_new_request",
+                client_id=client_id,
+                request_id=request_id,
+                bundle_id=bundle_id,
+                slot_idx=slot_idx,
+                prev_request_id=state.request_id if state is not None else None,
+                new_state=True,
+                reused_slot=True,
+            )
 
-        self._engine.remove_requests(torch.tensor([slot_idx], device=self._device))
+        self._remove_request_slot(
+            slot_idx=slot_idx,
+            reason="new_state_or_request_switch",
+            client_id=client_id,
+            request_id=request_id,
+            bundle_id=bundle_id,
+        )
 
         prompt_tokens = self._load_prompt_tokens(request_id)
         self._prime_state_from_prompt(slot_idx, prompt_tokens)
@@ -998,6 +1222,15 @@ class DasdInferenceController:
             next_token_id=next_token_id,
         )
         self._slot_states[client_id] = state
+        self._dasd_debug_log(
+            "state_created",
+            client_id=client_id,
+            request_id=request_id,
+            bundle_id=bundle_id,
+            state=state,
+            token_window=[],
+            new_state=True,
+        )
         return state
 
     def _load_prompt_tokens(self, request_id: str):

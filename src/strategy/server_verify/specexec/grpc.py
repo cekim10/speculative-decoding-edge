@@ -52,6 +52,7 @@ class SpecExecBatchServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
         self._all_sync = asyncio.Condition()
         self._mode = config.mode
         self._dasd_mode_enabled = self._mode == "dasd" and config.dasd_enable_async
+        self._mp_ctx = mp.get_context("spawn")
 
         self._shutdown_event = shutdown_event
         self._resp_queue_task = None
@@ -69,16 +70,16 @@ class SpecExecBatchServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
 
         if self._dasd_mode_enabled:
             self._logger.info("Initializing DASD verifier mode")
-            self._dasd_recv_queue = mp.Queue()
-            self._dasd_resp_queue = mp.Queue()
+            self._dasd_recv_queue = self._mp_ctx.Queue()
+            self._dasd_resp_queue = self._mp_ctx.Queue()
             self._resp_queue_task = self._loop.create_task(
                 self._init_dasd_resp_queue_loop()
             )
             self._init_dasd_inference_loop()
         else:
             self._logger.info("Initializing baseline SpecEdge server mode")
-            self._recv_queue = mp.Queue()
-            self._resp_queue = mp.Queue()
+            self._recv_queue = self._mp_ctx.Queue()
+            self._resp_queue = self._mp_ctx.Queue()
             self._resp_queue_task = self._loop.create_task(self._init_resp_queue_loop())
             self._init_inference_loop()
 
@@ -302,7 +303,7 @@ class SpecExecBatchServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
     def _init_inference_loop(self):
         if self._recv_queue is None or self._resp_queue is None:
             raise RuntimeError("Baseline queues are not initialized")
-        self._inference_process = mp.Process(
+        self._inference_process = self._mp_ctx.Process(
             target=_init_inference,
             args=(
                 self._num_clients,
@@ -316,7 +317,7 @@ class SpecExecBatchServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
     def _init_dasd_inference_loop(self):
         if self._dasd_recv_queue is None or self._dasd_resp_queue is None:
             raise RuntimeError("DASD queues are not initialized")
-        self._inference_process = mp.Process(
+        self._inference_process = self._mp_ctx.Process(
             target=_init_dasd_inference,
             args=(
                 self._num_clients,

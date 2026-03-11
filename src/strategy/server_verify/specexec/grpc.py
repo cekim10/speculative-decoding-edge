@@ -955,6 +955,7 @@ class DasdInferenceController:
                         request=request,
                         state=state,
                         reason=type(e).__name__,
+                        cuda_mem=self._dasd_cuda_memory(),
                     )
                 else:
                     reject_reason = f"terminal_failed:{type(e).__name__}:{e}"
@@ -1011,6 +1012,7 @@ class DasdInferenceController:
             "terminal_failed_request",
             request=request,
             reason=reason,
+            cuda_mem=self._dasd_cuda_memory(),
         )
 
     def _is_fatal_cuda_exception(self, exc: Exception):
@@ -1069,6 +1071,21 @@ class DasdInferenceController:
             token_max,
             " ".join(f"{key}={value}" for key, value in extra.items()),
         )
+
+    def _dasd_cuda_memory(self):
+        if not self._dasd_debug or self._device.type != "cuda" or not torch.cuda.is_available():
+            return None
+
+        return {
+            "alloc_mb": round(torch.cuda.memory_allocated(self._device) / (1024 * 1024), 1),
+            "reserved_mb": round(torch.cuda.memory_reserved(self._device) / (1024 * 1024), 1),
+            "max_alloc_mb": round(
+                torch.cuda.max_memory_allocated(self._device) / (1024 * 1024), 1
+            ),
+            "max_reserved_mb": round(
+                torch.cuda.max_memory_reserved(self._device) / (1024 * 1024), 1
+            ),
+        }
 
     def _safe_reject_bundle(
         self,
@@ -1155,6 +1172,7 @@ class DasdInferenceController:
             slot_idx=slot_idx,
             epoch=epoch,
             reason=reason,
+            cuda_mem=self._dasd_cuda_memory(),
         )
         self._engine.remove_requests(torch.tensor([slot_idx], device=self._device))
         self._dasd_debug_log(
@@ -1165,6 +1183,7 @@ class DasdInferenceController:
             slot_idx=slot_idx,
             epoch=epoch,
             reason=reason,
+            cuda_mem=self._dasd_cuda_memory(),
         )
 
     def _verify_bundle(self, request: specedge_pb2.VerifyBundleRequest):
@@ -1613,9 +1632,12 @@ class DasdInferenceController:
             decode_tokens=input_ids.numel(),
             single_token_prediction=True,
             phase=phase,
+            cuda_mem=self._dasd_cuda_memory(),
         )
 
-        with self._engine._past_key_values.prefill_context(1, slot_idx):
+        # DASD verifier decode should reuse the existing slot KV cache in place.
+        # prefill_context() clones the full slot cache and causes per-step memory growth.
+        with self._engine._past_key_values.slot_view_context(1, slot_idx):
             logits = self._model.forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -1624,6 +1646,28 @@ class DasdInferenceController:
                 attention_mask=attention_mask,
                 past_key_values=self._engine._past_key_values,
             )[0]
+        self._dasd_debug_log(
+            "predict_step_done",
+            client_id=client_id,
+            request_id=request_id,
+            bundle_id=bundle_id,
+            epoch=epoch,
+            slot_idx=slot_idx,
+            prompt_len=prompt_len,
+            committed_tokens_len=committed_tokens_len,
+            cache_batch_indices_shape=tuple(cache_batch_indices.shape),
+            cache_batch_indices=cache_batch_indices.tolist(),
+            cache_seq_indices_shape=tuple(cache_seq_indices.shape),
+            cache_seq_indices=cache_seq_indices.tolist(),
+            input_shape=tuple(input_ids.shape),
+            input_len=input_ids.size(-1),
+            position_shape=tuple(position_ids.shape),
+            position_len=position_ids.size(-1),
+            decode_tokens=input_ids.numel(),
+            single_token_prediction=True,
+            phase=phase,
+            cuda_mem=self._dasd_cuda_memory(),
+        )
         return int(logits[0, 0].argmax(dim=-1).item())
 
 

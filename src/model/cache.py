@@ -135,3 +135,21 @@ class KVCache:
         self.seq_indices = prev_seq_indices
         self.k_cache = prev_k_cache
         self.v_cache = prev_v_cache
+
+    @contextmanager
+    def slot_view_context(self, n_beams: int, batch_idx: int):
+        prev_seq_indices = self.seq_indices
+        prev_k_cache = self.k_cache
+        prev_v_cache = self.v_cache
+
+        # DASD single-step verification only needs a view of one slot.
+        self.seq_indices = torch.arange(n_beams, device=self.device)
+        self.k_cache = prev_k_cache.select(1, batch_idx).unsqueeze(1)
+        self.v_cache = prev_v_cache.select(1, batch_idx).unsqueeze(1)
+
+        try:
+            yield
+        finally:
+            self.seq_indices = prev_seq_indices
+            self.k_cache = prev_k_cache
+            self.v_cache = prev_v_cache

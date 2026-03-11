@@ -1553,7 +1553,22 @@ class DasdInferenceController:
         )
         state.committed_tokens.append(token_id)
         state.next_token_id = next_token_id
+        self._dasd_debug_log(
+            "advance_state_applied",
+            client_id=state.client_id,
+            request_id=state.request_id,
+            bundle_id=bundle_id,
+            slot_idx=state.slot_idx,
+            epoch=state.epoch,
+            state=state,
+            committed_tail=state.committed_tokens[max(0, len(state.committed_tokens) - 8) :],
+            next_token_id=state.next_token_id,
+            state_tensor_fields="none",
+            cleanup_safe=state.cleanup_safe,
+            cuda_mem=self._dasd_cuda_memory(),
+        )
 
+    @torch.inference_mode()
     def _predict_next_token(
         self,
         slot_idx: int,
@@ -1633,19 +1648,42 @@ class DasdInferenceController:
             single_token_prediction=True,
             phase=phase,
             cuda_mem=self._dasd_cuda_memory(),
+            grad_enabled=torch.is_grad_enabled(),
         )
 
         # DASD verifier decode should reuse the existing slot KV cache in place.
         # prefill_context() clones the full slot cache and causes per-step memory growth.
         with self._engine._past_key_values.slot_view_context(1, slot_idx):
-            logits = self._model.forward(
+            logits, returned_past_key_values = self._model.forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 cache_batch_indices=cache_batch_indices,
                 cache_seq_indices=cache_seq_indices,
                 attention_mask=attention_mask,
                 past_key_values=self._engine._past_key_values,
-            )[0]
+            )
+            self._dasd_debug_log(
+                "predict_forward_done",
+                client_id=client_id,
+                request_id=request_id,
+                bundle_id=bundle_id,
+                epoch=epoch,
+                slot_idx=slot_idx,
+                prompt_len=prompt_len,
+                committed_tokens_len=committed_tokens_len,
+                phase=phase,
+                logits_shape=tuple(logits.shape),
+                logits_requires_grad=bool(logits.requires_grad),
+                returned_cache_is_engine_cache=(
+                    returned_past_key_values is self._engine._past_key_values
+                ),
+                returned_cache_type=type(returned_past_key_values).__name__,
+                state_tensor_fields="none",
+                cuda_mem=self._dasd_cuda_memory(),
+            )
+            next_token_id = int(logits[0, 0].argmax(dim=-1).item())
+            del logits
+            del returned_past_key_values
         self._dasd_debug_log(
             "predict_step_done",
             client_id=client_id,
@@ -1667,8 +1705,9 @@ class DasdInferenceController:
             single_token_prediction=True,
             phase=phase,
             cuda_mem=self._dasd_cuda_memory(),
+            grad_enabled=torch.is_grad_enabled(),
         )
-        return int(logits[0, 0].argmax(dim=-1).item())
+        return next_token_id
 
 
 def _init_inference(

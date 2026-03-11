@@ -1265,10 +1265,25 @@ class DasdInferenceController:
 
         accept_bitmap: list[bool] = []
         accepted_len = 0
+        first_expected_token_id = int(state.next_token_id)
+        first_proposed_token_id = token_window[0] if token_window else None
+        first_mismatch_pos = -1
+        if config.dasd_debug:
+            self._logger.info(
+                "[DASD] verify req=%s bundle=%d epoch=%d base=%d expected_first=%s proposed_first=%s window=%s",
+                request.request_id,
+                int(request.bundle_id),
+                int(request.epoch),
+                int(request.base_token_index),
+                first_expected_token_id,
+                first_proposed_token_id,
+                token_window,
+            )
         for idx, token_id in enumerate(token_window):
             accepted = int(state.next_token_id) == token_id
             accept_bitmap.append(accepted)
             if not accepted:
+                first_mismatch_pos = idx
                 if idx < len(token_window) - 1:
                     accept_bitmap.extend([False] * (len(token_window) - idx - 1))
                 break
@@ -1288,7 +1303,21 @@ class DasdInferenceController:
             token_window=token_window,
             accepted_len=accepted_len,
             r_obs=f"{r_obs:.4f}",
+            expected_first_token_id=first_expected_token_id,
+            proposed_first_token_id=first_proposed_token_id,
+            first_mismatch_pos=first_mismatch_pos,
         )
+        if config.dasd_debug:
+            self._logger.info(
+                "[DASD] verify_result req=%s bundle=%d epoch=%d base=%d accepted=%d/%d mismatch_pos=%d",
+                request.request_id,
+                int(request.bundle_id),
+                int(request.epoch),
+                int(request.base_token_index),
+                accepted_len,
+                len(token_window),
+                first_mismatch_pos,
+            )
         return accept_bitmap, accepted_len, r_obs, "", self._cuda_poisoned
 
     def _ensure_client_state(

@@ -335,13 +335,14 @@ class SpecExecClient:
         state.next_base_index += state.window_size
         if config.dasd_debug:
             self._logger.info(
-                "[DASD] send req=%s bundle=%d epoch=%d base=%d W=%d inflight=%d",
+                "[DASD] send req=%s bundle=%d epoch=%d base=%d W=%d inflight=%d tokens=%s",
                 state.request_id,
                 bundle_id,
                 state.epoch,
                 base_token_index,
                 len(token_ids),
                 len(state.inflight),
+                token_ids,
             )
 
     async def _receive_one_round_for_dasd(self, state: DasdRequestState):

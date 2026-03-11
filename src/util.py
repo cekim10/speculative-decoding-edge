@@ -131,9 +131,10 @@ def warn_not_commit():
             check=True,
         )
         if result.stdout.strip():
+            indented_stdout = result.stdout.replace("\n", "\n  ")
             print(
                 "Warning: There are uncommitted changes \n\n"
-                f"{result.stdout.replace('\n', '\n  ')}"
+                f"{indented_stdout}"
             )
             proceed = input("Do you want to proceed? (y/N): ")
             if proceed.lower() != "y":

@@ -31,6 +31,7 @@ class DasdClientControlState:
 
 @dataclass
 class DasdVerifierState:
+    client_id: str
     slot_idx: int
     request_id: str
     epoch: int
@@ -988,6 +989,11 @@ class DasdInferenceController:
             prompt_len = state.prompt_len
             slot_idx = state.slot_idx
             state_epoch = state.epoch
+        else:
+            prompt_len = extra.get("prompt_len")
+            committed_tokens_len = extra.get("committed_tokens_len")
+            if prompt_len is not None and committed_tokens_len is not None:
+                generated_committed_len = committed_tokens_len - prompt_len
 
         window_len = len(token_window) if token_window is not None else 0
         token_min = min(token_window) if token_window else None
@@ -1306,8 +1312,15 @@ class DasdInferenceController:
             slot_idx=slot_idx,
             token_id=prompt_tokens[-1],
             position=len(prompt_tokens) - 1,
+            client_id=client_id,
+            request_id=request_id,
+            epoch=epoch,
+            prompt_len=len(prompt_tokens),
+            committed_tokens_len=len(prompt_tokens),
+            phase="init",
         )
         state = DasdVerifierState(
+            client_id=client_id,
             slot_idx=slot_idx,
             request_id=request_id,
             epoch=epoch,
@@ -1393,30 +1406,90 @@ class DasdInferenceController:
             slot_idx=state.slot_idx,
             token_id=token_id,
             position=position,
+            client_id=state.client_id,
+            request_id=state.request_id,
+            epoch=state.epoch,
+            prompt_len=state.prompt_len,
+            committed_tokens_len=len(state.committed_tokens) + 1,
+            phase="advance",
         )
         state.committed_tokens.append(token_id)
         state.next_token_id = next_token_id
 
-    def _predict_next_token(self, slot_idx: int, token_id: int, position: int):
+    def _predict_next_token(
+        self,
+        slot_idx: int,
+        token_id: int,
+        position: int,
+        client_id: str,
+        request_id: str,
+        epoch: int,
+        prompt_len: int,
+        committed_tokens_len: int,
+        phase: str,
+    ):
         if position >= self._max_len:
             return self._tokenizer.eos_token_id
 
         input_ids = torch.tensor([[token_id]], dtype=torch.long, device=self._device)
         position_ids = torch.tensor([[position]], dtype=torch.long, device=self._device)
-        cache_batch_indices = torch.tensor([slot_idx], dtype=torch.long, device=self._device)
+        cache_batch_indices = torch.zeros((1,), dtype=torch.long, device=self._device)
         cache_seq_indices = torch.tensor([position], dtype=torch.long, device=self._device)
         attention_mask = torch.zeros(
             (1, 1, 1, self._max_len), dtype=self._dtype, device=self._device
         )
         attention_mask[0, 0, 0, : position + 1] = 1
 
-        logits = self._engine.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            cache_batch_indices=cache_batch_indices,
-            cache_seq_indices=cache_seq_indices,
-            attention_mask=attention_mask,
+        if (
+            input_ids.numel() != 1
+            or position_ids.numel() != 1
+            or cache_batch_indices.numel() != 1
+            or cache_seq_indices.numel() != 1
+        ):
+            self._dasd_debug_log(
+                "predict_shape_invalid",
+                client_id=client_id,
+                request_id=request_id,
+                epoch=epoch,
+                slot_idx=slot_idx,
+                prompt_len=prompt_len,
+                committed_tokens_len=committed_tokens_len,
+                input_shape=tuple(input_ids.shape),
+                position_shape=tuple(position_ids.shape),
+                cache_batch_indices=cache_batch_indices.tolist(),
+                cache_seq_indices=cache_seq_indices.tolist(),
+                decode_tokens=input_ids.numel(),
+                phase=phase,
+            )
+            raise RuntimeError(
+                "DASD single-token prediction expected exactly one token/position/batch index"
+            )
+
+        self._dasd_debug_log(
+            "predict_step",
+            client_id=client_id,
+            request_id=request_id,
+            epoch=epoch,
+            slot_idx=slot_idx,
+            prompt_len=prompt_len,
+            committed_tokens_len=committed_tokens_len,
+            input_shape=tuple(input_ids.shape),
+            position_shape=tuple(position_ids.shape),
+            cache_batch_indices=cache_batch_indices.tolist(),
+            cache_seq_indices=cache_seq_indices.tolist(),
+            decode_tokens=input_ids.numel(),
+            phase=phase,
         )
+
+        with self._engine._past_key_values.prefill_context(1, slot_idx):
+            logits = self._model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                cache_batch_indices=cache_batch_indices,
+                cache_seq_indices=cache_seq_indices,
+                attention_mask=attention_mask,
+                past_key_values=self._engine._past_key_values,
+            )[0]
         return int(logits[0, 0].argmax(dim=-1).item())
 
 

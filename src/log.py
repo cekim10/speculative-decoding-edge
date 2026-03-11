@@ -85,31 +85,18 @@ def get_default_log_config(log_dir: Path, file_name: str):
                 "formatter": "iso",
                 "level": "DEBUG",
             },
-            "queue_handler": {
-                "class": "logging.handlers.QueueHandler",
-                "handlers": ["console", "file"],
-                "listener": f"{__name__}.QueueListener",
-                "queue": {"()": "multiprocessing.Queue", "maxsize": -1},
-                "respect_handler_level": True,
-            },
             "result": {
                 "()": f"{__name__}.ResultHandler",
                 "file_path": result_file_path,
             },
-            "result_queue_handler": {
-                "class": "logging.handlers.QueueHandler",
-                "handlers": ["result"],
-                "listener": f"{__name__}.QueueListener",
-                "queue": {"()": "multiprocessing.Queue", "maxsize": -1},
-            },
         },
         "loggers": {
             "custom_log_result": {
-                "handlers": ["result_queue_handler"],
+                "handlers": ["result"],
                 "level": "INFO",
                 "propagate": False,
             },
-            "root": {"handlers": ["queue_handler"], "level": "DEBUG"},
+            "root": {"handlers": ["console", "file"], "level": "DEBUG"},
         },
     }
 

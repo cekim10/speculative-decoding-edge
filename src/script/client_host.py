@@ -73,6 +73,7 @@ def main(config_file: str):
     max_request_num = config["client"]["max_request_num"]
     mode = config.get("mode", "specedge")
     dasd_cfg = config.get("dasd", {})
+    max_client_processes = int(config["server"]["num_clients"])
 
     # node configuration
     nodes = config["node"]
@@ -82,6 +83,8 @@ def main(config_file: str):
     client_idx = 0
     for node_name, node_info in nodes.items():
         for client_info in node_info:
+            if client_idx >= max_client_processes:
+                break
             device = client_info["device"]
 
             logger.info("Starting a client_%s on %s, %s", client_idx, node_name, device)
@@ -146,6 +149,14 @@ def main(config_file: str):
 
             ssh_processes[client_idx] = process
             client_idx += 1
+        if client_idx >= max_client_processes:
+            break
+
+    logger.info(
+        "Spawned %d client process(es) (server.num_clients=%d)",
+        len(ssh_processes),
+        max_client_processes,
+    )
 
     for client_idx, process in ssh_processes.items():
         process.wait()

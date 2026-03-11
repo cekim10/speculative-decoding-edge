@@ -51,6 +51,7 @@ class SpecExecClient:
         self._mode = config.mode
         self._dasd_enabled = self._mode == "dasd" and config.dasd_enable_async
         self._dasd_client_id = f"{config.process_name}@{socket.gethostname()}"
+        self._dasd_server_poisoned = False
 
         self._verify_configs()
 
@@ -389,6 +390,8 @@ class SpecExecClient:
                     next_credit=state.window_size,
                     server_queue_delay_ms=0.0,
                     server_service_ms=0.0,
+                    reject_reason="rpc_failure",
+                    verifier_poisoned=False,
                 )
             state.responses_by_base[task_info.base_token_index] = DasdBundleResult(
                 response=response,
@@ -419,6 +422,10 @@ class SpecExecClient:
             accepted_len = max(0, min(int(result.response.accepted_len), verified_len))
             rtt_ms = (result.recv_ts - task_info.send_ts) * 1000.0
             next_credit = int(result.response.next_credit)
+            reject_reason = str(getattr(result.response, "reject_reason", ""))
+            verifier_poisoned = bool(
+                getattr(result.response, "verifier_poisoned", False)
+            )
             if next_credit > 0:
                 state.window_size = max(
                     config.dasd_w_min, min(config.dasd_w_max, next_credit)
@@ -462,9 +469,32 @@ class SpecExecClient:
                         result.response.server_queue_delay_ms
                     ),
                     "server_service_ms": float(result.response.server_service_ms),
+                    "reject_reason": reject_reason,
+                    "verifier_poisoned": verifier_poisoned,
                     "mode": "dasd",
                 }
             )
+
+            if verifier_poisoned:
+                self._dasd_server_poisoned = True
+                state.aborted = True
+                state.abort_reason = (
+                    reject_reason if reject_reason else "verifier_poisoned"
+                )
+                abort_task = asyncio.create_task(
+                    self._abort_dasd_request(state, reason=state.abort_reason)
+                )
+                abort_task.add_done_callback(lambda _: None)
+                return
+
+            if reject_reason.startswith("terminal_failed:"):
+                state.aborted = True
+                state.abort_reason = reject_reason
+                abort_task = asyncio.create_task(
+                    self._abort_dasd_request(state, reason=reject_reason)
+                )
+                abort_task.add_done_callback(lambda _: None)
+                return
 
             if (
                 accepted_len == 0
@@ -1105,3 +1135,6 @@ class SpecExecClient:
         dst_indices = torch.arange(src_indices.size(-1), device=self._device)
 
         self._engine.gather(src_indices, dst_indices)
+    @property
+    def dasd_server_poisoned(self):
+        return self._dasd_server_poisoned

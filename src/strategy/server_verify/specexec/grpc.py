@@ -70,6 +70,7 @@ class SpecExecBatchServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
         self._dasd_resp_queue = None
         self._dasd_futures: dict[tuple[str, str, int], asyncio.Future] = {}
         self._dasd_client_state: dict[str, DasdClientControlState] = {}
+        self._dasd_verifier_poisoned = False
 
         if self._dasd_mode_enabled:
             self._logger.info("Initializing DASD verifier mode")
@@ -148,7 +149,8 @@ class SpecExecBatchServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
                 with self._resp_lock:
                     if key in self._dasd_futures:
                         future = self._dasd_futures.pop(key)
-                        future.set_result(payload)
+                        if not future.done():
+                            future.set_result(payload)
                     else:
                         self._logger.warning("Stale DASD response received for key=%s", key)
             except Exception as e:
@@ -260,6 +262,8 @@ class SpecExecBatchServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
         queue_delay_ms = float(payload.get("queue_delay_ms", 0.0))
         service_ms = float(payload.get("server_service_ms", 0.0))
         queue_depth = int(payload.get("queue_depth", -1))
+        reject_reason = str(payload.get("reject_reason", ""))
+        verifier_poisoned = bool(payload.get("verifier_poisoned", False))
 
         self._result_logger.log(
             {
@@ -280,6 +284,8 @@ class SpecExecBatchServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
                     "queue_depth": queue_depth,
                     "inflight_count": state.inflight_count,
                     "ema_acceptance": state.ema_acceptance,
+                    "reject_reason": reject_reason,
+                    "verifier_poisoned": verifier_poisoned,
                     "total_verified_tokens": state.total_verified_tokens,
                     "total_accepted_tokens": state.total_accepted_tokens,
                 },
@@ -296,6 +302,8 @@ class SpecExecBatchServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
             next_credit=next_credit,
             server_queue_delay_ms=queue_delay_ms,
             server_service_ms=service_ms,
+            reject_reason=reject_reason,
+            verifier_poisoned=verifier_poisoned,
         )
 
     def _apply_aimd_credit(self, current_credit: int, loss_event: bool):
@@ -892,6 +900,7 @@ class DasdInferenceController:
         self._slot_cap = max(1, self._num_clients)
         self._available_slots = list(range(self._slot_cap))
         self._cuda_poisoned = False
+        self._global_poison_reason = ""
 
     def loop(self):
         self._logger.debug("Starting DASD inference loop")
@@ -910,8 +919,16 @@ class DasdInferenceController:
             request.ParseFromString(raw_data)
 
             process_start = time.perf_counter()
+            reject_reason = ""
+            verifier_poisoned = self._cuda_poisoned
             try:
-                accept_bitmap, accepted_len, r_obs = self._verify_bundle(request)
+                (
+                    accept_bitmap,
+                    accepted_len,
+                    r_obs,
+                    reject_reason,
+                    verifier_poisoned,
+                ) = self._verify_bundle(request)
             except Exception as e:
                 self._mark_terminal_failed_request(
                     request,
@@ -919,6 +936,9 @@ class DasdInferenceController:
                 )
                 if self._is_fatal_cuda_exception(e):
                     self._cuda_poisoned = True
+                    self._global_poison_reason = f"{type(e).__name__}:{e}"
+                    verifier_poisoned = True
+                    reject_reason = f"terminal_failed:{self._global_poison_reason}"
                     state = self._slot_states.get(request.client_id)
                     if state is not None:
                         state.cleanup_safe = False
@@ -926,6 +946,10 @@ class DasdInferenceController:
                             self._client_epochs.get(request.client_id, state.epoch),
                             state.epoch,
                         )
+                    self._logger.error(
+                        "DASD verifier globally poisoned: %s",
+                        self._global_poison_reason,
+                    )
                     self._dasd_debug_log(
                         "cuda_poisoned",
                         request=request,
@@ -933,6 +957,7 @@ class DasdInferenceController:
                         reason=type(e).__name__,
                     )
                 else:
+                    reject_reason = f"terminal_failed:{type(e).__name__}:{e}"
                     self._invalidate_client_state(
                         client_id=request.client_id,
                         reason=f"verification_exception:{type(e).__name__}",
@@ -958,6 +983,8 @@ class DasdInferenceController:
                 "queue_delay_ms": queue_delay_ms,
                 "server_service_ms": service_ms,
                 "queue_depth": queue_depth,
+                "reject_reason": reject_reason,
+                "verifier_poisoned": verifier_poisoned,
             }
             self._resp_queue.put((key, payload))
 
@@ -1071,7 +1098,7 @@ class DasdInferenceController:
                 client_id=request.client_id,
                 reason=reason,
             )
-        return ([False] * len(token_window), 0, 0.0)
+        return ([False] * len(token_window), 0, 0.0, reason, self._cuda_poisoned)
 
     def _is_valid_slot_idx(self, slot_idx: int):
         return 0 <= slot_idx < self._slot_cap
@@ -1165,7 +1192,11 @@ class DasdInferenceController:
             return self._safe_reject_bundle(
                 request,
                 token_window,
-                reason="cuda_poisoned",
+                reason=(
+                    f"cuda_poisoned:{self._global_poison_reason}"
+                    if self._global_poison_reason
+                    else "cuda_poisoned"
+                ),
             )
 
         if any(token_id < 0 for token_id in token_window):
@@ -1230,7 +1261,7 @@ class DasdInferenceController:
                 state=state,
                 token_window=token_window,
             )
-            return ([False] * len(token_window), 0, 0.0)
+            return ([False] * len(token_window), 0, 0.0, "base_mismatch", False)
 
         accept_bitmap: list[bool] = []
         accepted_len = 0
@@ -1258,7 +1289,7 @@ class DasdInferenceController:
             accepted_len=accepted_len,
             r_obs=f"{r_obs:.4f}",
         )
-        return accept_bitmap, accepted_len, r_obs
+        return accept_bitmap, accepted_len, r_obs, "", self._cuda_poisoned
 
     def _ensure_client_state(
         self, client_id: str, request_id: str, epoch: int, bundle_id: int

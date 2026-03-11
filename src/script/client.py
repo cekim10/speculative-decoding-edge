@@ -43,12 +43,10 @@ async def main():
         config.dataset, model_name=config.draft_model, reasoning=config.reasoning
     )
 
-    max_req_num = (
-        len(dataset) if config.max_request_num == -1 else config.max_request_num
-    )
-
     req_indices = list(range(len(dataset)))
-    req_indices = req_indices[config.req_offset : max_req_num][:: config.sample_req_cnt]
+    req_indices = req_indices[config.req_offset :][:: config.sample_req_cnt]
+    if config.max_request_num != -1:
+        req_indices = req_indices[: config.max_request_num]
 
     random.seed(config.client_idx)
     random.shuffle(req_indices)
@@ -65,12 +63,17 @@ async def main():
     )
     for i, req_idx in enumerate(req_indices):
         logger.info("Request %s/%s, req_idx: %s", i + 1, len(req_indices), req_idx)
-        await generate(
+        server_poisoned = await generate(
             req_idx=req_idx,
             prompt=dataset[req_idx],
             engine=engine,
             tokenizer=tokenizer,
         )
+        if server_poisoned:
+            logger.warning(
+                "Stopping further DASD requests because the verifier is globally poisoned."
+            )
+            break
 
 
 async def generate(engine, tokenizer, req_idx: int, prompt: str):
@@ -82,6 +85,7 @@ async def generate(engine, tokenizer, req_idx: int, prompt: str):
     )
 
     await client.generate(req_idx)
+    return client.dasd_server_poisoned
 
 
 if __name__ == "__main__":

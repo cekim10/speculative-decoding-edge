@@ -51,4 +51,6 @@ message VerifyBundleResponse {
     int32 next_credit = 7;
     float server_queue_delay_ms = 8;
     float server_service_ms = 9;
+    string reject_reason = 10;
+    bool verifier_poisoned = 11;
 }

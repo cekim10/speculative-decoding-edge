@@ -218,6 +218,8 @@ class DasdRequestState:
     late_task_drop_count: int = 0
     inflight_cleanup_count: int = 0
     rpc_failure_count: int = 0
+    rpc_unavailable_abort_count: int = 0
+    unexpected_stall_count: int = 0
     sum_window_at_send: int = 0
     sum_tree_depth_at_send: int = 0
     sum_leaf_budget_at_send: int = 0

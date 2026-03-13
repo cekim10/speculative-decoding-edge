@@ -283,7 +283,10 @@ class SpecExecClient:
         """
 
         if self._dasd_enabled:
-            await self._generate_dasd(req_idx)
+            try:
+                await self._generate_dasd(req_idx)
+            finally:
+                await self._validator.close()
             return
 
         self._logger.info("Generating sequence req_idx=%d", req_idx)
@@ -329,6 +332,7 @@ class SpecExecClient:
             "Generated sequence: \n%s",
             self._tokenizer.decode(self._prefix_tokens[0], skip_special_tokens=True),
         )
+        await self._validator.close()
 
     async def _cycle(self, req_idx: int, step_idx: int, prefill=False) -> torch.Tensor:
         with util.Timing(device=self._device, mode="sync") as draft_t:
@@ -438,10 +442,23 @@ class SpecExecClient:
                     )
                 elif not state.aborted:
                     self._logger.warning(
-                        "No inflight DASD bundle for req_idx=%d; stopping generation as unexpected stall.",
-                        req_idx,
+                        "[DASD] unexpected_empty_inflight req=%s epoch=%d committed=%d next_base=%d drafted=%d",
+                        state.request_id,
+                        state.epoch,
+                        state.committed_len,
+                        state.next_base_index,
+                        len(state.drafted_tokens),
                     )
-                    finish_status = "stalled"
+                    state.next_base_index = state.committed_len
+                    self._draft_more_for_dasd(state, max(1, state.window_size))
+                    await self._fill_inflight_for_dasd(state)
+                    if not state.inflight:
+                        state.unexpected_stall_count += 1
+                        await self._abort_dasd_request(
+                            state,
+                            reason="unexpected_empty_inflight",
+                        )
+                        finish_status = "explicit_abort_reason"
                 break
 
             await self._receive_one_round_for_dasd(state)
@@ -523,6 +540,8 @@ class SpecExecClient:
                 "late_task_drop_count": state.late_task_drop_count,
                 "inflight_cleanup_count": state.inflight_cleanup_count,
                 "rpc_failure_count": state.rpc_failure_count,
+                "rpc_unavailable_abort_count": state.rpc_unavailable_abort_count,
+                "unexpected_stall_count": state.unexpected_stall_count,
                 "average_W": (
                     state.sum_window_at_send / state.verify_rounds
                     if state.verify_rounds > 0
@@ -1242,6 +1261,12 @@ class SpecExecClient:
 
     async def _send_bundle_for_dasd(self, state: DasdRequestState):
         if state.aborted:
+            if config.dasd_debug:
+                self._logger.info(
+                    "[DASD] send_skipped req=%s epoch=%d reason=request_inactive",
+                    state.request_id,
+                    state.epoch,
+                )
             return
         bundle_id = state.next_bundle_id
         base_token_index = state.next_base_index
@@ -1339,6 +1364,13 @@ class SpecExecClient:
 
     async def _receive_one_round_for_dasd(self, state: DasdRequestState):
         if state.aborted or not state.inflight:
+            if config.dasd_debug and state.aborted:
+                self._logger.info(
+                    "[DASD] receive_skipped req=%s epoch=%d reason=request_inactive inflight=%d",
+                    state.request_id,
+                    state.epoch,
+                    len(state.inflight),
+                )
             return
 
         wait_tasks = list(state.task_to_bundle.keys())
@@ -1376,6 +1408,22 @@ class SpecExecClient:
             try:
                 response = task.result()
                 state.consecutive_rpc_failures = 0
+                if (
+                    task_info.request_id != state.request_id
+                    or task_info.epoch_at_send != state.epoch
+                ):
+                    state.stale_epoch_drop_count += 1
+                    if config.dasd_debug:
+                        self._logger.info(
+                            "[DASD] stale_response_ignored req=%s active_epoch=%d task_request=%s task_epoch=%d bundle=%d base=%d",
+                            state.request_id,
+                            state.epoch,
+                            task_info.request_id,
+                            task_info.epoch_at_send,
+                            task_info.bundle_id,
+                            task_info.base_token_index,
+                        )
+                    continue
             except grpc.aio.AioRpcError as e:
                 status_code = e.code()
                 if status_code == grpc.StatusCode.CANCELLED:
@@ -1399,6 +1447,7 @@ class SpecExecClient:
                     status_code.name,
                 )
                 if status_code == grpc.StatusCode.UNAVAILABLE:
+                    state.rpc_unavailable_abort_count += 1
                     await self._abort_dasd_request(
                         state,
                         reason="rpc_unavailable",

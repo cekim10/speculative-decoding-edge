@@ -16,6 +16,9 @@ class GrpcClientController:
         self._channel = grpc.aio.insecure_channel(self._host)
         self._stub = specedge_pb2_grpc.SpecEdgeServiceStub(self._channel)
 
+    async def close(self):
+        await self._channel.close()
+
     async def request(
         self,
         client_idx: int,

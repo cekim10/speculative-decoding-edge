@@ -1269,7 +1269,11 @@ class DasdInferenceController:
             )
 
         current_epoch = self._client_epochs.get(request.client_id, -1)
-        if request.epoch < current_epoch:
+        if (
+            active_state is not None
+            and active_state.request_id == request.request_id
+            and request.epoch < current_epoch
+        ):
             return self._safe_reject_bundle(
                 request,
                 token_window,

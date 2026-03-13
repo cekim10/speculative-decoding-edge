@@ -168,6 +168,8 @@ class SpecEdgeClientConfig(metaclass=_ConfigMeta):
             os.getenv("SPECEDGE_DASD_REJECTION_PENALTY", "1")
         )
         cls.dasd_success_bonus = int(os.getenv("SPECEDGE_DASD_SUCCESS_BONUS", "1"))
+        # Adaptive-window bounds. If these are not explicitly provided,
+        # fall back to the legacy DASD window bounds for backward compatibility.
         cls.dasd_min_window = int(
             os.getenv("SPECEDGE_DASD_MIN_WINDOW", str(cls.dasd_w_min))
         )

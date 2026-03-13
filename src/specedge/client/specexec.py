@@ -331,6 +331,9 @@ class SpecExecClient:
             config.dasd_adaptive_credit_enabled
             and config.dasd_adaptive_window_enabled
         ):
+            # Joint controller path: credit drives the next external speculation
+            # window. The controller bounds come from min/max_window, which
+            # already fall back to legacy W_min/W_max in config loading.
             fallback_window = (
                 previous_window
                 if previous_window > 0

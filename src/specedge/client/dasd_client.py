@@ -210,6 +210,7 @@ class DasdRequestState:
     same_base_retry_count: int = 0
     recovery_mode_entries: int = 0
     failure_cache_hits: int = 0
+    forced_commit_count: int = 0
     sum_window_at_send: int = 0
     sum_tree_depth_at_send: int = 0
     sum_leaf_budget_at_send: int = 0
@@ -218,6 +219,7 @@ class DasdRequestState:
     failure_cache: dict[tuple[int, tuple[int, ...]], dict[int, DasdFailureCacheEntry]] = (
         field(default_factory=dict)
     )
+    forced_commits_by_base: dict[int, int] = field(default_factory=dict)
     recovery_mode_active: bool = False
     recovery_mode_rounds_left: int = 0
     recovery_mode_reason: str = ""

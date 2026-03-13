@@ -70,6 +70,11 @@ dasd:
   recovery_forced_w: 1
   recovery_forced_tree_depth: 1
   recovery_forced_leaf_budget: 2
+  recovery_forced_commit_enabled: true
+  recovery_forced_commit_same_base_retry_threshold: 3
+  recovery_forced_commit_full_rejection_threshold: 2
+  recovery_forced_commit_max_per_base: 1
+  recovery_fallback_decode_steps: 1
   global_budget_C_total: 0
   ema_decay: 0.9
   rollback_avoid_failed_token: true

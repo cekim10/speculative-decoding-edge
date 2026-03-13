@@ -264,6 +264,8 @@ class SpecExecBatchServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
         queue_depth = int(payload.get("queue_depth", -1))
         reject_reason = str(payload.get("reject_reason", ""))
         verifier_poisoned = bool(payload.get("verifier_poisoned", False))
+        verifier_next_token_id = int(payload.get("verifier_next_token_id", 0))
+        forced_commit_eligible = bool(payload.get("forced_commit_eligible", False))
 
         self._result_logger.log(
             {
@@ -304,6 +306,8 @@ class SpecExecBatchServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
             server_service_ms=service_ms,
             reject_reason=reject_reason,
             verifier_poisoned=verifier_poisoned,
+            verifier_next_token_id=verifier_next_token_id,
+            forced_commit_eligible=forced_commit_eligible,
         )
 
     def _apply_aimd_credit(self, current_credit: int, loss_event: bool):
@@ -928,6 +932,8 @@ class DasdInferenceController:
                     r_obs,
                     reject_reason,
                     verifier_poisoned,
+                    verifier_next_token_id,
+                    forced_commit_eligible,
                 ) = self._verify_bundle(request)
             except Exception as e:
                 self._mark_terminal_failed_request(
@@ -973,6 +979,8 @@ class DasdInferenceController:
                 accept_bitmap = [False] * len(request.token_ids)
                 accepted_len = 0
                 r_obs = 0.0
+                verifier_next_token_id = 0
+                forced_commit_eligible = False
             service_ms = (time.perf_counter() - process_start) * 1000.0
             queue_delay_ms = (process_start - enqueue_ts) * 1000.0
 
@@ -986,6 +994,8 @@ class DasdInferenceController:
                 "queue_depth": queue_depth,
                 "reject_reason": reject_reason,
                 "verifier_poisoned": verifier_poisoned,
+                "verifier_next_token_id": verifier_next_token_id,
+                "forced_commit_eligible": forced_commit_eligible,
             }
             self._resp_queue.put((key, payload))
 
@@ -1115,7 +1125,15 @@ class DasdInferenceController:
                 client_id=request.client_id,
                 reason=reason,
             )
-        return ([False] * len(token_window), 0, 0.0, reason, self._cuda_poisoned)
+        return (
+            [False] * len(token_window),
+            0,
+            0.0,
+            reason,
+            self._cuda_poisoned,
+            int(state.next_token_id) if state is not None else 0,
+            False,
+        )
 
     def _is_valid_slot_idx(self, slot_idx: int):
         return 0 <= slot_idx < self._slot_cap
@@ -1280,7 +1298,15 @@ class DasdInferenceController:
                 state=state,
                 token_window=token_window,
             )
-            return ([False] * len(token_window), 0, 0.0, "base_mismatch", False)
+            return (
+                [False] * len(token_window),
+                0,
+                0.0,
+                "base_mismatch",
+                False,
+                int(state.next_token_id),
+                False,
+            )
 
         accept_bitmap: list[bool] = []
         accepted_len = 0
@@ -1337,7 +1363,15 @@ class DasdInferenceController:
                 len(token_window),
                 first_mismatch_pos,
             )
-        return accept_bitmap, accepted_len, r_obs, "", self._cuda_poisoned
+        return (
+            accept_bitmap,
+            accepted_len,
+            r_obs,
+            "",
+            self._cuda_poisoned,
+            first_expected_token_id,
+            True,
+        )
 
     def _ensure_client_state(
         self, client_id: str, request_id: str, epoch: int, bundle_id: int

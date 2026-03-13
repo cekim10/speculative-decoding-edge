@@ -312,6 +312,7 @@ class SpecExecClient:
                 "same_base_retry_count": state.same_base_retry_count,
                 "recovery_mode_entries": state.recovery_mode_entries,
                 "failure_cache_hits": state.failure_cache_hits,
+                "forced_commit_count": state.forced_commit_count,
                 "average_W": (
                     state.sum_window_at_send / state.verify_rounds
                     if state.verify_rounds > 0
@@ -663,6 +664,127 @@ class SpecExecClient:
                 state.tree_budget,
             )
 
+    def _should_force_commit(
+        self,
+        state: DasdRequestState,
+        base_token_index: int,
+        response,
+    ):
+        if not (
+            config.dasd_recovery_mode_enabled
+            and config.dasd_recovery_forced_commit_enabled
+            and state.recovery_mode_active
+        ):
+            return False
+        if not bool(getattr(response, "forced_commit_eligible", False)):
+            return False
+        if int(getattr(response, "verifier_next_token_id", 0)) < 0:
+            return False
+        if state.forced_commits_by_base.get(base_token_index, 0) >= max(
+            1, config.dasd_recovery_forced_commit_max_per_base
+        ):
+            return False
+        same_base_retries = state.base_retry_counts.get(base_token_index, 0)
+        if (
+            same_base_retries
+            >= config.dasd_recovery_forced_commit_same_base_retry_threshold
+        ):
+            return True
+        if (
+            state.consecutive_full_rejections
+            >= config.dasd_recovery_forced_commit_full_rejection_threshold
+        ):
+            return True
+        return False
+
+    def _apply_forced_commit(
+        self,
+        state: DasdRequestState,
+        task_info: DasdTaskInfo,
+        response,
+    ):
+        base_token_index = task_info.base_token_index
+        token_id = int(getattr(response, "verifier_next_token_id", -1))
+        if token_id < 0:
+            return False
+        old_prefix_key = self._dasd_prefix_key(state)
+
+        if config.dasd_debug:
+            self._logger.info(
+                "[DASD] forced_commit_trigger req=%s epoch=%d committed=%d base=%d same_base_retries=%d full_rejection_streak=%d recovery_mode=%s verifier_next_token_id=%d",
+                state.request_id,
+                state.epoch,
+                state.committed_len,
+                base_token_index,
+                state.base_retry_counts.get(base_token_index, 0),
+                state.consecutive_full_rejections,
+                state.recovery_mode_active,
+                token_id,
+            )
+
+        state.forced_commits_by_base[base_token_index] = (
+            state.forced_commits_by_base.get(base_token_index, 0) + 1
+        )
+        state.forced_commit_count += 1
+        state.epoch += 1
+        cancelled_tasks = []
+        for inflight_info in state.inflight.values():
+            inflight_info.task.cancel()
+            cancelled_tasks.append(inflight_info.task)
+        if cancelled_tasks:
+            drain_task = asyncio.gather(*cancelled_tasks, return_exceptions=True)
+            drain_task.add_done_callback(lambda _: None)
+        state.inflight.clear()
+        state.task_to_bundle.clear()
+        state.responses_by_base.clear()
+        state.drafted_tokens = state.drafted_tokens[: state.committed_len]
+        state.drafted_tokens.append(token_id)
+        state.committed_len += 1
+        state.next_base_index = state.committed_len
+        state.consecutive_full_rejections = 0
+        state.rollback_blocked_committed_len = None
+        state.rollback_blocked_token_id = None
+
+        state.failure_cache.pop(old_prefix_key, None)
+        state.base_retry_counts.pop(base_token_index, None)
+
+        self._reset_tree_from_dasd_state(state, use_full_drafted=False)
+        if config.dasd_debug:
+            self._logger.info(
+                "[DASD] forced_commit_apply req=%s epoch=%d committed=%d base=%d token_id=%d forced_commit_count=%d",
+                state.request_id,
+                state.epoch,
+                state.committed_len,
+                base_token_index,
+                token_id,
+                state.forced_commit_count,
+            )
+            self._logger.info(
+                "[DASD] fallback_decode_step req=%s epoch=%d committed=%d base=%d step=%d token_id=%d",
+                state.request_id,
+                state.epoch,
+                state.committed_len,
+                base_token_index,
+                min(
+                    state.forced_commits_by_base.get(base_token_index, 0),
+                    max(1, config.dasd_recovery_fallback_decode_steps),
+                ),
+                token_id,
+            )
+
+        self._exit_recovery_mode(state, reason="forced_commit_progress")
+        if config.dasd_debug:
+            self._logger.info(
+                "[DASD] forced_commit_done req=%s epoch=%d committed=%d base=%d token_id=%d recovery_mode=%s",
+                state.request_id,
+                state.epoch,
+                state.committed_len,
+                base_token_index,
+                token_id,
+                state.recovery_mode_active,
+            )
+        return True
+
     async def _fill_inflight_for_dasd(self, state: DasdRequestState):
         if state.aborted:
             return
@@ -853,6 +975,12 @@ class SpecExecClient:
             verifier_poisoned = bool(
                 getattr(result.response, "verifier_poisoned", False)
             )
+            verifier_next_token_id = int(
+                getattr(result.response, "verifier_next_token_id", 0)
+            )
+            forced_commit_eligible = bool(
+                getattr(result.response, "forced_commit_eligible", False)
+            )
             state.verify_rounds += 1
             state.sum_window_at_send += task_info.window_size_at_send
             state.sum_tree_depth_at_send += task_info.tree_depth_at_send
@@ -890,6 +1018,7 @@ class SpecExecClient:
                 state.max_full_rejection_streak,
                 state.consecutive_full_rejections,
             )
+            forced_commit_applied = False
             if accepted_len > 0:
                 self._exit_recovery_mode(state, reason="committed_progress")
             elif (
@@ -914,6 +1043,12 @@ class SpecExecClient:
                 )
                 if state.recovery_mode_rounds_left == 0:
                     self._exit_recovery_mode(state, reason="recovery_round_budget_exhausted")
+            if self._should_force_commit(state, prev_committed, result.response):
+                forced_commit_applied = self._apply_forced_commit(
+                    state,
+                    task_info=task_info,
+                    response=result.response,
+                )
             if config.dasd_debug:
                 self._logger.info(
                     "[DASD] commit req=%s bundle=%d accepted=%d/%d committed=%d credit=%s W=%d tree_budget=%s",
@@ -949,6 +1084,9 @@ class SpecExecClient:
                     "accepted_len": accepted_len,
                     "r_obs": float(result.response.r_obs),
                     "next_credit": next_credit,
+                    "verifier_next_token_id": verifier_next_token_id,
+                    "forced_commit_eligible": forced_commit_eligible,
+                    "forced_commit_applied": forced_commit_applied,
                     "credit_before": (
                         control_feedback.get("credit_before")
                         if control_feedback is not None
@@ -994,6 +1132,9 @@ class SpecExecClient:
                     "mode": "dasd",
                 }
             )
+
+            if forced_commit_applied:
+                return
 
             if verifier_poisoned:
                 self._dasd_server_poisoned = True

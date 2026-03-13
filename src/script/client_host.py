@@ -198,6 +198,21 @@ def main(config_file: str):
                 "SPECEDGE_DASD_RECOVERY_FORCED_LEAF_BUDGET": dasd_cfg.get(
                     "recovery_forced_leaf_budget", 2
                 ),
+                "SPECEDGE_DASD_RECOVERY_FORCED_COMMIT_ENABLED": dasd_cfg.get(
+                    "recovery_forced_commit_enabled", True
+                ),
+                "SPECEDGE_DASD_RECOVERY_FORCED_COMMIT_SAME_BASE_RETRY_THRESHOLD": dasd_cfg.get(
+                    "recovery_forced_commit_same_base_retry_threshold", 3
+                ),
+                "SPECEDGE_DASD_RECOVERY_FORCED_COMMIT_FULL_REJECTION_THRESHOLD": dasd_cfg.get(
+                    "recovery_forced_commit_full_rejection_threshold", 2
+                ),
+                "SPECEDGE_DASD_RECOVERY_FORCED_COMMIT_MAX_PER_BASE": dasd_cfg.get(
+                    "recovery_forced_commit_max_per_base", 1
+                ),
+                "SPECEDGE_DASD_RECOVERY_FALLBACK_DECODE_STEPS": dasd_cfg.get(
+                    "recovery_fallback_decode_steps", 1
+                ),
                 "SPECEDGE_DASD_DEBUG": dasd_cfg.get("debug", False),
             }
 

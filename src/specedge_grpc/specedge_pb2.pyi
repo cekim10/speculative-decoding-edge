@@ -69,7 +69,7 @@ class VerifyBundleRequest(_message.Message):
     def __init__(self, client_id: _Optional[str] = ..., request_id: _Optional[str] = ..., bundle_id: _Optional[int] = ..., base_token_index: _Optional[int] = ..., prompt_hash: _Optional[str] = ..., prefix_hash: _Optional[str] = ..., token_ids: _Optional[_Iterable[int]] = ..., timestamp_send_ms: _Optional[int] = ..., draft_model_id: _Optional[str] = ..., epoch: _Optional[int] = ...) -> None: ...
 
 class VerifyBundleResponse(_message.Message):
-    __slots__ = ("request_id", "bundle_id", "base_token_index", "accept_bitmap", "accepted_len", "r_obs", "next_credit", "server_queue_delay_ms", "server_service_ms", "reject_reason", "verifier_poisoned")
+    __slots__ = ("request_id", "bundle_id", "base_token_index", "accept_bitmap", "accepted_len", "r_obs", "next_credit", "server_queue_delay_ms", "server_service_ms", "reject_reason", "verifier_poisoned", "verifier_next_token_id", "forced_commit_eligible")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     BUNDLE_ID_FIELD_NUMBER: _ClassVar[int]
     BASE_TOKEN_INDEX_FIELD_NUMBER: _ClassVar[int]
@@ -81,6 +81,8 @@ class VerifyBundleResponse(_message.Message):
     SERVER_SERVICE_MS_FIELD_NUMBER: _ClassVar[int]
     REJECT_REASON_FIELD_NUMBER: _ClassVar[int]
     VERIFIER_POISONED_FIELD_NUMBER: _ClassVar[int]
+    VERIFIER_NEXT_TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
+    FORCED_COMMIT_ELIGIBLE_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     bundle_id: int
     base_token_index: int
@@ -92,4 +94,6 @@ class VerifyBundleResponse(_message.Message):
     server_service_ms: float
     reject_reason: str
     verifier_poisoned: bool
-    def __init__(self, request_id: _Optional[str] = ..., bundle_id: _Optional[int] = ..., base_token_index: _Optional[int] = ..., accept_bitmap: _Optional[_Iterable[bool]] = ..., accepted_len: _Optional[int] = ..., r_obs: _Optional[float] = ..., next_credit: _Optional[int] = ..., server_queue_delay_ms: _Optional[float] = ..., server_service_ms: _Optional[float] = ..., reject_reason: _Optional[str] = ..., verifier_poisoned: bool = ...) -> None: ...
+    verifier_next_token_id: int
+    forced_commit_eligible: bool
+    def __init__(self, request_id: _Optional[str] = ..., bundle_id: _Optional[int] = ..., base_token_index: _Optional[int] = ..., accept_bitmap: _Optional[_Iterable[bool]] = ..., accepted_len: _Optional[int] = ..., r_obs: _Optional[float] = ..., next_credit: _Optional[int] = ..., server_queue_delay_ms: _Optional[float] = ..., server_service_ms: _Optional[float] = ..., reject_reason: _Optional[str] = ..., verifier_poisoned: bool = ..., verifier_next_token_id: _Optional[int] = ..., forced_commit_eligible: bool = ...) -> None: ...

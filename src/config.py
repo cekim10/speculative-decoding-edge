@@ -216,6 +216,25 @@ class SpecEdgeClientConfig(metaclass=_ConfigMeta):
         cls.dasd_recovery_forced_leaf_budget = int(
             os.getenv("SPECEDGE_DASD_RECOVERY_FORCED_LEAF_BUDGET", "2")
         )
+        cls.dasd_recovery_forced_commit_enabled = (
+            os.getenv("SPECEDGE_DASD_RECOVERY_FORCED_COMMIT_ENABLED", "True") == "True"
+        )
+        cls.dasd_recovery_forced_commit_same_base_retry_threshold = int(
+            os.getenv(
+                "SPECEDGE_DASD_RECOVERY_FORCED_COMMIT_SAME_BASE_RETRY_THRESHOLD", "3"
+            )
+        )
+        cls.dasd_recovery_forced_commit_full_rejection_threshold = int(
+            os.getenv(
+                "SPECEDGE_DASD_RECOVERY_FORCED_COMMIT_FULL_REJECTION_THRESHOLD", "2"
+            )
+        )
+        cls.dasd_recovery_forced_commit_max_per_base = int(
+            os.getenv("SPECEDGE_DASD_RECOVERY_FORCED_COMMIT_MAX_PER_BASE", "1")
+        )
+        cls.dasd_recovery_fallback_decode_steps = int(
+            os.getenv("SPECEDGE_DASD_RECOVERY_FALLBACK_DECODE_STEPS", "1")
+        )
         cls.dasd_debug = os.getenv("SPECEDGE_DASD_DEBUG", "False") == "True"
 
         cls._initialized = True

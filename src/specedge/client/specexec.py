@@ -231,8 +231,30 @@ class SpecExecClient:
         self._draft_more_for_dasd(state, initial_target)
 
         eos_flag = False
-        finish_status = "finished"
+        finish_status = ""
         while state.committed_len < self._max_new_tokens and not eos_flag and not state.aborted:
+            if state.fallback_burst_active:
+                progressed = await self._run_fallback_burst_step(state)
+                if state.finish_status == "eos_reached":
+                    eos_flag = True
+                    break
+                if state.aborted or state.finish_status in {
+                    "max_new_tokens_reached",
+                    "explicit_abort_reason",
+                }:
+                    break
+                if progressed:
+                    if (
+                        state.committed_len > 0
+                        and state.committed_len <= len(state.drafted_tokens)
+                        and state.drafted_tokens[state.committed_len - 1]
+                        == self._tokenizer.eos_token_id
+                    ):
+                        eos_flag = True
+                        state.finish_status = "eos_reached"
+                        break
+                    continue
+
             await self._fill_inflight_for_dasd(state)
             if not state.inflight:
                 if not state.aborted:
@@ -262,12 +284,16 @@ class SpecExecClient:
             ):
                 eos_flag = True
 
-        if state.aborted:
-            finish_status = "aborted"
+        if state.finish_status:
+            finish_status = state.finish_status
+        elif state.aborted:
+            finish_status = "explicit_abort_reason"
         elif eos_flag:
-            finish_status = "finished"
+            finish_status = "eos_reached"
         elif state.committed_len >= self._max_new_tokens:
-            finish_status = "truncated"
+            finish_status = "max_new_tokens_reached"
+        elif finish_status == "":
+            finish_status = "stalled"
         state.finish_status = finish_status
 
         await self._drain_dasd_inflight(state)
@@ -346,6 +372,13 @@ class SpecExecClient:
         )
 
         self._logger.info("Finished DASD generation req_idx=%d", req_idx)
+        self._logger.info(
+            "[DASD] generation_finish_reason req=%s reason=%s committed=%d aborted=%s",
+            state.request_id,
+            state.finish_status,
+            state.committed_len,
+            state.aborted,
+        )
         self._logger.info(
             "Generated sequence: \n%s",
             self._tokenizer.decode(self._prefix_tokens[0], skip_special_tokens=True),
@@ -638,6 +671,50 @@ class SpecExecClient:
                 state.tree_budget,
             )
 
+    def _enter_fallback_burst(
+        self,
+        state: DasdRequestState,
+        reason: str,
+        sync_base: Optional[int] = None,
+        sync_token_id: Optional[int] = None,
+    ):
+        state.fallback_burst_active = True
+        state.fallback_burst_total_steps = max(0, config.dasd_recovery_fallback_decode_steps)
+        state.fallback_burst_steps_left = state.fallback_burst_total_steps
+        state.fallback_burst_sync_base = sync_base
+        state.fallback_burst_sync_token_id = sync_token_id
+        if config.dasd_debug:
+            self._logger.info(
+                "[DASD] fallback_burst_enter req=%s epoch=%d committed=%d base=%d steps=%d reason=%s sync_base=%s sync_token_id=%s",
+                state.request_id,
+                state.epoch,
+                state.committed_len,
+                state.committed_len,
+                state.fallback_burst_steps_left,
+                reason,
+                sync_base,
+                sync_token_id,
+            )
+
+    def _exit_fallback_burst(self, state: DasdRequestState, reason: str):
+        if not state.fallback_burst_active:
+            return
+        if config.dasd_debug:
+            self._logger.info(
+                "[DASD] fallback_burst_exit req=%s epoch=%d committed=%d base=%d remaining_steps=%d reason=%s",
+                state.request_id,
+                state.epoch,
+                state.committed_len,
+                state.committed_len,
+                state.fallback_burst_steps_left,
+                reason,
+            )
+        state.fallback_burst_active = False
+        state.fallback_burst_steps_left = 0
+        state.fallback_burst_total_steps = 0
+        state.fallback_burst_sync_base = None
+        state.fallback_burst_sync_token_id = None
+
     def _exit_recovery_mode(self, state: DasdRequestState, reason: str):
         if not state.recovery_mode_active:
             return
@@ -663,6 +740,148 @@ class SpecExecClient:
                 previous_tree_budget,
                 state.tree_budget,
             )
+
+    async def _run_fallback_burst_step(self, state: DasdRequestState):
+        if not state.fallback_burst_active:
+            return False
+
+        if state.committed_len >= self._max_new_tokens:
+            state.finish_status = "max_new_tokens_reached"
+            self._exit_fallback_burst(state, reason="max_new_tokens_reached")
+            return False
+
+        # One-time server-state realignment for the token that was already forced
+        # committed locally at the stuck base.
+        if (
+            state.fallback_burst_sync_base is not None
+            and state.fallback_burst_sync_token_id is not None
+        ):
+            sync_response = await self._validator.verify_bundle(
+                client_id=self._dasd_client_id,
+                request_id=state.request_id,
+                bundle_id=state.next_bundle_id,
+                epoch=state.epoch,
+                base_token_index=state.fallback_burst_sync_base,
+                token_ids=[],
+                timestamp_send_ms=int(time.time() * 1000),
+                draft_model_id=config.draft_model,
+                recovery_fallback_decode=True,
+            )
+            state.next_bundle_id += 1
+            if int(getattr(sync_response, "verifier_next_token_id", -1)) != int(
+                state.fallback_burst_sync_token_id
+            ):
+                reason = "fallback_sync_mismatch"
+                if config.dasd_debug:
+                    self._logger.info(
+                        "[DASD] fallback_burst_abort req=%s epoch=%d committed=%d base=%d reason=%s verifier_next_token_id=%s expected_sync_token=%s",
+                        state.request_id,
+                        state.epoch,
+                        state.committed_len,
+                        state.committed_len,
+                        reason,
+                        int(getattr(sync_response, "verifier_next_token_id", -1)),
+                        state.fallback_burst_sync_token_id,
+                    )
+                if config.dasd_recovery_abort_on_missing_verifier_token:
+                    state.aborted = True
+                    state.abort_reason = reason
+                    state.finish_status = "explicit_abort_reason"
+                self._exit_fallback_burst(state, reason=reason)
+                return False
+            state.fallback_burst_sync_base = None
+            state.fallback_burst_sync_token_id = None
+
+        if state.fallback_burst_steps_left <= 0:
+            self._exit_fallback_burst(state, reason="burst_steps_completed")
+            return False
+
+        step_idx = state.fallback_burst_total_steps - state.fallback_burst_steps_left + 1
+        base_token_index = state.committed_len
+        if config.dasd_debug:
+            self._logger.info(
+                "[DASD] fallback_burst_step req=%s epoch=%d committed=%d base=%d step_idx=%d steps_left=%d",
+                state.request_id,
+                state.epoch,
+                state.committed_len,
+                base_token_index,
+                step_idx,
+                state.fallback_burst_steps_left,
+            )
+
+        response = await self._validator.verify_bundle(
+            client_id=self._dasd_client_id,
+            request_id=state.request_id,
+            bundle_id=state.next_bundle_id,
+            epoch=state.epoch,
+            base_token_index=base_token_index,
+            token_ids=[],
+            timestamp_send_ms=int(time.time() * 1000),
+            draft_model_id=config.draft_model,
+            recovery_fallback_decode=True,
+        )
+        state.next_bundle_id += 1
+        token_id = int(getattr(response, "verifier_next_token_id", -1))
+        if token_id < 0:
+            reason = "missing_verifier_next_token"
+            if config.dasd_debug:
+                self._logger.info(
+                    "[DASD] fallback_burst_abort req=%s epoch=%d committed=%d base=%d step_idx=%d reason=%s",
+                    state.request_id,
+                    state.epoch,
+                    state.committed_len,
+                    base_token_index,
+                    step_idx,
+                    reason,
+                )
+            if config.dasd_recovery_abort_on_missing_verifier_token:
+                state.aborted = True
+                state.abort_reason = reason
+                state.finish_status = "explicit_abort_reason"
+            self._exit_fallback_burst(state, reason=reason)
+            return False
+
+        old_prefix_key = self._dasd_prefix_key(state)
+        state.drafted_tokens = state.drafted_tokens[: state.committed_len]
+        state.drafted_tokens.append(token_id)
+        state.committed_len += 1
+        state.next_base_index = state.committed_len
+        state.consecutive_full_rejections = 0
+        state.rollback_blocked_committed_len = None
+        state.rollback_blocked_token_id = None
+        state.failure_cache.pop(old_prefix_key, None)
+        state.base_retry_counts.pop(base_token_index, None)
+        self._reset_tree_from_dasd_state(state, use_full_drafted=False)
+        blocked_tokens = sorted(self._blocked_tokens_for_prefix(state))
+        if config.dasd_debug:
+            prefix_tail = state.drafted_tokens[max(0, state.committed_len - 8) : state.committed_len]
+            self._logger.info(
+                "[DASD] fallback_burst_commit req=%s epoch=%d committed=%d base=%d step_idx=%d token_id=%d prefix_tail=%s blocked_tokens=%s recovery_mode=%s fallback_burst=%s",
+                state.request_id,
+                state.epoch,
+                state.committed_len,
+                base_token_index,
+                step_idx,
+                token_id,
+                prefix_tail,
+                blocked_tokens,
+                state.recovery_mode_active,
+                state.fallback_burst_active,
+            )
+        state.fallback_burst_steps_left -= 1
+
+        if token_id == self._tokenizer.eos_token_id:
+            state.finish_status = "eos_reached"
+            self._exit_fallback_burst(state, reason="eos_reached")
+            return False
+        if state.committed_len >= self._max_new_tokens:
+            state.finish_status = "max_new_tokens_reached"
+            self._exit_fallback_burst(state, reason="max_new_tokens_reached")
+            return False
+        if state.fallback_burst_steps_left == 0:
+            self._exit_fallback_burst(state, reason="burst_steps_completed")
+            return False
+        return True
 
     def _should_force_commit(
         self,
@@ -759,19 +978,12 @@ class SpecExecClient:
                 token_id,
                 state.forced_commit_count,
             )
-            self._logger.info(
-                "[DASD] fallback_decode_step req=%s epoch=%d committed=%d base=%d step=%d token_id=%d",
-                state.request_id,
-                state.epoch,
-                state.committed_len,
-                base_token_index,
-                min(
-                    state.forced_commits_by_base.get(base_token_index, 0),
-                    max(1, config.dasd_recovery_fallback_decode_steps),
-                ),
-                token_id,
-            )
-
+        self._enter_fallback_burst(
+            state,
+            reason="forced_commit_progress",
+            sync_base=base_token_index,
+            sync_token_id=token_id,
+        )
         self._exit_recovery_mode(state, reason="forced_commit_progress")
         if config.dasd_debug:
             self._logger.info(
@@ -941,6 +1153,8 @@ class SpecExecClient:
                     server_service_ms=0.0,
                     reject_reason="rpc_failure",
                     verifier_poisoned=False,
+                    verifier_next_token_id=-1,
+                    forced_commit_eligible=False,
                 )
             state.responses_by_base[task_info.base_token_index] = DasdBundleResult(
                 response=response,

@@ -68,6 +68,7 @@ class GrpcClientController:
         token_ids: list[int],
         timestamp_send_ms: int = 0,
         draft_model_id: str = "",
+        recovery_fallback_decode: bool = False,
     ):
         request = specedge_pb2.VerifyBundleRequest(
             client_id=client_id,
@@ -78,6 +79,7 @@ class GrpcClientController:
             token_ids=token_ids,
             timestamp_send_ms=timestamp_send_ms,
             draft_model_id=draft_model_id,
+            recovery_fallback_decode=recovery_fallback_decode,
         )
 
         return await self._stub.VerifyBundleAsync(request)

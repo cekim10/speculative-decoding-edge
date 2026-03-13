@@ -223,6 +223,11 @@ class DasdRequestState:
     recovery_mode_active: bool = False
     recovery_mode_rounds_left: int = 0
     recovery_mode_reason: str = ""
+    fallback_burst_active: bool = False
+    fallback_burst_steps_left: int = 0
+    fallback_burst_total_steps: int = 0
+    fallback_burst_sync_base: Optional[int] = None
+    fallback_burst_sync_token_id: Optional[int] = None
 
     def speculative_tokens(self):
         return max(0, len(self.drafted_tokens) - self.committed_len)

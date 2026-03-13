@@ -1308,6 +1308,30 @@ class DasdInferenceController:
                 False,
             )
 
+        if request.recovery_fallback_decode:
+            fallback_token_id = int(state.next_token_id)
+            self._dasd_debug_log(
+                "fallback_decode",
+                request=request,
+                state=state,
+                token_window=token_window,
+                verifier_next_token_id=fallback_token_id,
+            )
+            self._advance_state(
+                state=state,
+                token_id=fallback_token_id,
+                bundle_id=int(request.bundle_id),
+            )
+            return (
+                [],
+                0,
+                1.0,
+                "",
+                self._cuda_poisoned,
+                fallback_token_id,
+                True,
+            )
+
         accept_bitmap: list[bool] = []
         accepted_len = 0
         first_expected_token_id = int(state.next_token_id)

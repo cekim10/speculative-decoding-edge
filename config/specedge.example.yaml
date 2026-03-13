@@ -74,7 +74,9 @@ dasd:
   recovery_forced_commit_same_base_retry_threshold: 3
   recovery_forced_commit_full_rejection_threshold: 2
   recovery_forced_commit_max_per_base: 1
-  recovery_fallback_decode_steps: 1
+  recovery_fallback_decode_steps: 4
+  recovery_fallback_exit_on_acceptance: false
+  recovery_abort_on_missing_verifier_token: true
   global_budget_C_total: 0
   ema_decay: 0.9
   debug: false

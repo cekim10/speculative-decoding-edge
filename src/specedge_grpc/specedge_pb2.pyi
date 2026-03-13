@@ -45,7 +45,7 @@ class SyncResponse(_message.Message):
     def __init__(self) -> None: ...
 
 class VerifyBundleRequest(_message.Message):
-    __slots__ = ("client_id", "request_id", "bundle_id", "base_token_index", "prompt_hash", "prefix_hash", "token_ids", "timestamp_send_ms", "draft_model_id", "epoch")
+    __slots__ = ("client_id", "request_id", "bundle_id", "base_token_index", "prompt_hash", "prefix_hash", "token_ids", "timestamp_send_ms", "draft_model_id", "epoch", "recovery_fallback_decode")
     CLIENT_ID_FIELD_NUMBER: _ClassVar[int]
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     BUNDLE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -56,6 +56,7 @@ class VerifyBundleRequest(_message.Message):
     TIMESTAMP_SEND_MS_FIELD_NUMBER: _ClassVar[int]
     DRAFT_MODEL_ID_FIELD_NUMBER: _ClassVar[int]
     EPOCH_FIELD_NUMBER: _ClassVar[int]
+    RECOVERY_FALLBACK_DECODE_FIELD_NUMBER: _ClassVar[int]
     client_id: str
     request_id: str
     bundle_id: int
@@ -66,7 +67,8 @@ class VerifyBundleRequest(_message.Message):
     timestamp_send_ms: int
     draft_model_id: str
     epoch: int
-    def __init__(self, client_id: _Optional[str] = ..., request_id: _Optional[str] = ..., bundle_id: _Optional[int] = ..., base_token_index: _Optional[int] = ..., prompt_hash: _Optional[str] = ..., prefix_hash: _Optional[str] = ..., token_ids: _Optional[_Iterable[int]] = ..., timestamp_send_ms: _Optional[int] = ..., draft_model_id: _Optional[str] = ..., epoch: _Optional[int] = ...) -> None: ...
+    recovery_fallback_decode: bool
+    def __init__(self, client_id: _Optional[str] = ..., request_id: _Optional[str] = ..., bundle_id: _Optional[int] = ..., base_token_index: _Optional[int] = ..., prompt_hash: _Optional[str] = ..., prefix_hash: _Optional[str] = ..., token_ids: _Optional[_Iterable[int]] = ..., timestamp_send_ms: _Optional[int] = ..., draft_model_id: _Optional[str] = ..., epoch: _Optional[int] = ..., recovery_fallback_decode: bool = ...) -> None: ...
 
 class VerifyBundleResponse(_message.Message):
     __slots__ = ("request_id", "bundle_id", "base_token_index", "accept_bitmap", "accepted_len", "r_obs", "next_credit", "server_queue_delay_ms", "server_service_ms", "reject_reason", "verifier_poisoned", "verifier_next_token_id", "forced_commit_eligible")

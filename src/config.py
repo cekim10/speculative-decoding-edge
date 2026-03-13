@@ -233,7 +233,15 @@ class SpecEdgeClientConfig(metaclass=_ConfigMeta):
             os.getenv("SPECEDGE_DASD_RECOVERY_FORCED_COMMIT_MAX_PER_BASE", "1")
         )
         cls.dasd_recovery_fallback_decode_steps = int(
-            os.getenv("SPECEDGE_DASD_RECOVERY_FALLBACK_DECODE_STEPS", "1")
+            os.getenv("SPECEDGE_DASD_RECOVERY_FALLBACK_DECODE_STEPS", "4")
+        )
+        cls.dasd_recovery_fallback_exit_on_acceptance = (
+            os.getenv("SPECEDGE_DASD_RECOVERY_FALLBACK_EXIT_ON_ACCEPTANCE", "False")
+            == "True"
+        )
+        cls.dasd_recovery_abort_on_missing_verifier_token = (
+            os.getenv("SPECEDGE_DASD_RECOVERY_ABORT_ON_MISSING_VERIFIER_TOKEN", "True")
+            == "True"
         )
         cls.dasd_debug = os.getenv("SPECEDGE_DASD_DEBUG", "False") == "True"
 

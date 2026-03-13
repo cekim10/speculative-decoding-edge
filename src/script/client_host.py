@@ -211,7 +211,13 @@ def main(config_file: str):
                     "recovery_forced_commit_max_per_base", 1
                 ),
                 "SPECEDGE_DASD_RECOVERY_FALLBACK_DECODE_STEPS": dasd_cfg.get(
-                    "recovery_fallback_decode_steps", 1
+                    "recovery_fallback_decode_steps", 4
+                ),
+                "SPECEDGE_DASD_RECOVERY_FALLBACK_EXIT_ON_ACCEPTANCE": dasd_cfg.get(
+                    "recovery_fallback_exit_on_acceptance", False
+                ),
+                "SPECEDGE_DASD_RECOVERY_ABORT_ON_MISSING_VERIFIER_TOKEN": dasd_cfg.get(
+                    "recovery_abort_on_missing_verifier_token", True
                 ),
                 "SPECEDGE_DASD_DEBUG": dasd_cfg.get("debug", False),
             }

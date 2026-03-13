@@ -193,6 +193,158 @@ class SpecExecClient:
         )
         cleanup_task.add_done_callback(lambda _: None)
 
+    def _dasd_eos_seen(self, state: DasdRequestState):
+        return (
+            state.committed_len > 0
+            and state.committed_len <= len(state.drafted_tokens)
+            and state.drafted_tokens[state.committed_len - 1] == self._tokenizer.eos_token_id
+        )
+
+    def _log_finish_condition(self, state: DasdRequestState, reason: str):
+        if config.dasd_debug:
+            self._logger.info(
+                "[DASD] finish_condition_evaluated req=%s epoch=%d reason=%s committed_len=%d drafted_len=%d next_base_index=%d inflight_count=%d outstanding_task_count=%d max_new_tokens=%d eos_seen=%s aborted=%s",
+                state.request_id,
+                state.epoch,
+                reason,
+                state.committed_len,
+                len(state.drafted_tokens),
+                state.next_base_index,
+                len(state.inflight),
+                len(state.task_to_bundle),
+                self._max_new_tokens,
+                self._dasd_eos_seen(state),
+                state.aborted,
+            )
+
+    def _can_continue_dasd_generation(self, state: DasdRequestState):
+        return (
+            not state.aborted
+            and state.committed_len < self._max_new_tokens
+            and not self._dasd_eos_seen(state)
+        )
+
+    def _prepare_dasd_refill_from_committed(self, state: DasdRequestState, reason: str):
+        state.next_base_index = state.committed_len
+        state.drafted_tokens = state.drafted_tokens[: state.committed_len]
+        state.responses_by_base.clear()
+        state.cleanup_induced_drain = False
+        if config.dasd_debug:
+            prefix_tail = state.drafted_tokens[max(0, state.committed_len - 8) : state.committed_len]
+            blocked_tokens = sorted(self._blocked_tokens_for_prefix(state))
+            self._logger.info(
+                "[DASD] rollback_rebuild_start req=%s epoch=%d committed=%d next_base=%d reason=%s prefix_tail=%s blocked_tokens=%s",
+                state.request_id,
+                state.epoch,
+                state.committed_len,
+                state.next_base_index,
+                reason,
+                prefix_tail,
+                blocked_tokens,
+            )
+        state.rollback_rebuild_count += 1
+        self._reset_tree_from_dasd_state(state, use_full_drafted=False)
+        if config.dasd_debug:
+            prefix_tail = state.drafted_tokens[max(0, state.committed_len - 8) : state.committed_len]
+            self._logger.info(
+                "[DASD] rollback_rebuild_end req=%s epoch=%d committed=%d next_base=%d drafted_len=%d prefix_tail=%s",
+                state.request_id,
+                state.epoch,
+                state.committed_len,
+                state.next_base_index,
+                len(state.drafted_tokens),
+                prefix_tail,
+            )
+
+    async def _attempt_dasd_refill_recovery(
+        self,
+        state: DasdRequestState,
+        reason: str,
+        bounded_attempts: int = 2,
+    ):
+        if not self._can_continue_dasd_generation(state):
+            self._log_finish_condition(state, reason=f"refill_skipped:{reason}")
+            return False
+
+        if reason == "unexpected_empty_inflight":
+            state.unexpected_empty_inflight_recovery_count += 1
+            if config.dasd_debug:
+                self._logger.info(
+                    "[DASD] unexpected_empty_inflight_recovery_start req=%s epoch=%d committed=%d next_base=%d drafted_len=%d inflight=%d",
+                    state.request_id,
+                    state.epoch,
+                    state.committed_len,
+                    state.next_base_index,
+                    len(state.drafted_tokens),
+                    len(state.inflight),
+                )
+
+        for attempt_idx in range(1, bounded_attempts + 1):
+            state.refill_attempt_count += 1
+            if config.dasd_debug:
+                self._logger.info(
+                    "[DASD] refill_attempt req=%s epoch=%d attempt=%d reason=%s committed=%d drafted=%d next_base=%d inflight=%d",
+                    state.request_id,
+                    state.epoch,
+                    attempt_idx,
+                    reason,
+                    state.committed_len,
+                    len(state.drafted_tokens),
+                    state.next_base_index,
+                    len(state.inflight),
+                )
+            self._prepare_dasd_refill_from_committed(state, reason=reason)
+            await self._fill_inflight_for_dasd(state)
+            if state.inflight:
+                state.refill_success_count += 1
+                if reason == "unexpected_empty_inflight":
+                    state.premature_stall_prevented_count += 1
+                    if config.dasd_debug:
+                        self._logger.info(
+                            "[DASD] unexpected_empty_inflight_recovery_success req=%s epoch=%d committed=%d inflight=%d",
+                            state.request_id,
+                            state.epoch,
+                            state.committed_len,
+                            len(state.inflight),
+                        )
+                if config.dasd_debug:
+                    self._logger.info(
+                        "[DASD] refill_scheduled req=%s epoch=%d attempt=%d reason=%s inflight=%d next_base=%d",
+                        state.request_id,
+                        state.epoch,
+                        attempt_idx,
+                        reason,
+                        len(state.inflight),
+                        state.next_base_index,
+                    )
+                return True
+
+        state.refill_skip_count += 1
+        if reason == "unexpected_empty_inflight":
+            state.unexpected_empty_inflight_recovery_fail_count += 1
+            if config.dasd_debug:
+                self._logger.info(
+                    "[DASD] unexpected_empty_inflight_recovery_fail req=%s epoch=%d committed=%d drafted=%d next_base=%d inflight=%d",
+                    state.request_id,
+                    state.epoch,
+                    state.committed_len,
+                    len(state.drafted_tokens),
+                    state.next_base_index,
+                    len(state.inflight),
+                )
+        if config.dasd_debug:
+            self._logger.info(
+                "[DASD] refill_skipped req=%s epoch=%d reason=%s committed=%d drafted=%d next_base=%d inflight=%d",
+                state.request_id,
+                state.epoch,
+                reason,
+                state.committed_len,
+                len(state.drafted_tokens),
+                state.next_base_index,
+                len(state.inflight),
+            )
+        return False
+
     def _cancel_dasd_inflight(self, state: DasdRequestState, reason: str):
         task_infos = list(state.inflight.values())
         before_count = len(task_infos)
@@ -431,34 +583,35 @@ class SpecExecClient:
 
             await self._fill_inflight_for_dasd(state)
             if not state.inflight:
-                if state.cleanup_induced_drain:
-                    self._logger.info(
-                        "[DASD] cleanup_drain req=%s epoch=%d reason=%s finish_status=%s aborted=%s",
-                        state.request_id,
-                        state.epoch,
-                        state.cleanup_reason,
-                        state.finish_status,
-                        state.aborted,
+                if self._can_continue_dasd_generation(state):
+                    refill_reason = (
+                        state.cleanup_reason
+                        if state.cleanup_induced_drain and state.cleanup_reason
+                        else "unexpected_empty_inflight"
                     )
-                elif not state.aborted:
-                    self._logger.warning(
-                        "[DASD] unexpected_empty_inflight req=%s epoch=%d committed=%d next_base=%d drafted=%d",
-                        state.request_id,
-                        state.epoch,
-                        state.committed_len,
-                        state.next_base_index,
-                        len(state.drafted_tokens),
-                    )
-                    state.next_base_index = state.committed_len
-                    self._draft_more_for_dasd(state, max(1, state.window_size))
-                    await self._fill_inflight_for_dasd(state)
-                    if not state.inflight:
-                        state.unexpected_stall_count += 1
-                        await self._abort_dasd_request(
-                            state,
-                            reason="unexpected_empty_inflight",
+                    if config.dasd_debug:
+                        self._logger.info(
+                            "[DASD] cleanup_drain req=%s epoch=%d reason=%s finish_status=%s aborted=%s",
+                            state.request_id,
+                            state.epoch,
+                            refill_reason,
+                            state.finish_status,
+                            state.aborted,
                         )
-                        finish_status = "explicit_abort_reason"
+                    recovered = await self._attempt_dasd_refill_recovery(
+                        state,
+                        reason=refill_reason,
+                    )
+                    if recovered:
+                        continue
+                    state.unexpected_stall_count += 1
+                    await self._abort_dasd_request(
+                        state,
+                        reason="unexpected_empty_inflight_recovery_failed",
+                    )
+                    finish_status = "explicit_abort_reason"
+                else:
+                    self._log_finish_condition(state, reason="loop_exit_no_inflight")
                 break
 
             await self._receive_one_round_for_dasd(state)
@@ -473,10 +626,7 @@ class SpecExecClient:
                 state.committed_len = len(state.drafted_tokens)
 
             if (
-                state.committed_len > 0
-                and state.committed_len <= len(state.drafted_tokens)
-                and state.drafted_tokens[state.committed_len - 1]
-                == self._tokenizer.eos_token_id
+                self._dasd_eos_seen(state)
             ):
                 eos_flag = True
 
@@ -489,8 +639,9 @@ class SpecExecClient:
         elif state.committed_len >= self._max_new_tokens:
             finish_status = "max_new_tokens_reached"
         elif finish_status == "":
-            finish_status = "stalled"
+            finish_status = "refill_not_possible"
         state.finish_status = finish_status
+        self._log_finish_condition(state, reason=finish_status)
 
         await self._drain_dasd_inflight(state)
 
@@ -542,6 +693,13 @@ class SpecExecClient:
                 "rpc_failure_count": state.rpc_failure_count,
                 "rpc_unavailable_abort_count": state.rpc_unavailable_abort_count,
                 "unexpected_stall_count": state.unexpected_stall_count,
+                "refill_attempt_count": state.refill_attempt_count,
+                "refill_success_count": state.refill_success_count,
+                "refill_skip_count": state.refill_skip_count,
+                "rollback_rebuild_count": state.rollback_rebuild_count,
+                "unexpected_empty_inflight_recovery_count": state.unexpected_empty_inflight_recovery_count,
+                "unexpected_empty_inflight_recovery_fail_count": state.unexpected_empty_inflight_recovery_fail_count,
+                "premature_stall_prevented_count": state.premature_stall_prevented_count,
                 "average_W": (
                     state.sum_window_at_send / state.verify_rounds
                     if state.verify_rounds > 0
@@ -1234,6 +1392,24 @@ class SpecExecClient:
     async def _fill_inflight_for_dasd(self, state: DasdRequestState):
         if state.aborted:
             return
+        if state.committed_len > len(state.drafted_tokens):
+            self._logger.warning(
+                "[DASD] state_inconsistency req=%s epoch=%d reason=committed_gt_drafted committed=%d drafted=%d",
+                state.request_id,
+                state.epoch,
+                state.committed_len,
+                len(state.drafted_tokens),
+            )
+            state.drafted_tokens = state.drafted_tokens[: state.committed_len]
+        if state.next_base_index < state.committed_len:
+            self._logger.warning(
+                "[DASD] state_inconsistency req=%s epoch=%d reason=next_base_lt_committed next_base=%d committed=%d",
+                state.request_id,
+                state.epoch,
+                state.next_base_index,
+                state.committed_len,
+            )
+            state.next_base_index = state.committed_len
         while len(state.inflight) < config.dasd_max_inflight_bundles:
             required_end = state.next_base_index + state.window_size
             if required_end > len(state.drafted_tokens):
@@ -1765,9 +1941,9 @@ class SpecExecClient:
                     )
                     drain_task.add_done_callback(lambda _: None)
 
-                state.drafted_tokens = state.drafted_tokens[: state.committed_len]
-                state.next_base_index = state.committed_len
-                self._reset_tree_from_dasd_state(state, use_full_drafted=False)
+                self._prepare_dasd_refill_from_committed(
+                    state, reason="rollback_cleanup"
+                )
                 if config.dasd_debug:
                     committed_prefix_tail = state.drafted_tokens[
                         max(0, state.committed_len - 8) : state.committed_len

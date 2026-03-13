@@ -220,6 +220,13 @@ class DasdRequestState:
     rpc_failure_count: int = 0
     rpc_unavailable_abort_count: int = 0
     unexpected_stall_count: int = 0
+    refill_attempt_count: int = 0
+    refill_success_count: int = 0
+    refill_skip_count: int = 0
+    rollback_rebuild_count: int = 0
+    unexpected_empty_inflight_recovery_count: int = 0
+    unexpected_empty_inflight_recovery_fail_count: int = 0
+    premature_stall_prevented_count: int = 0
     sum_window_at_send: int = 0
     sum_tree_depth_at_send: int = 0
     sum_leaf_budget_at_send: int = 0

@@ -893,7 +893,7 @@ class DasdInferenceController:
         self._vocab_size = self._resolve_effective_vocab_size()
 
         self._client_slots: dict[str, int] = {}
-        self._client_epochs: dict[str, int] = {}
+        self._request_epochs: dict[tuple[str, str], int] = {}
         self._slot_states: dict[str, DasdVerifierState] = {}
         self._terminal_failed_requests: dict[tuple[str, str, int], str] = {}
         self._retired_requests: dict[tuple[str, str], str] = {}
@@ -940,6 +940,9 @@ class DasdInferenceController:
             reason=reason,
         )
 
+    def _request_epoch_key(self, client_id: str, request_id: str):
+        return (client_id, request_id)
+
     def loop(self):
         self._logger.debug("Starting DASD inference loop")
         while True:
@@ -982,8 +985,11 @@ class DasdInferenceController:
                     state = self._slot_states.get(request.client_id)
                     if state is not None:
                         state.cleanup_safe = False
-                        self._client_epochs[request.client_id] = max(
-                            self._client_epochs.get(request.client_id, state.epoch),
+                        request_epoch_key = self._request_epoch_key(
+                            request.client_id, state.request_id
+                        )
+                        self._request_epochs[request_epoch_key] = max(
+                            self._request_epochs.get(request_epoch_key, state.epoch),
                             state.epoch,
                         )
                     self._logger.error(
@@ -1176,8 +1182,9 @@ class DasdInferenceController:
         state = self._slot_states.pop(client_id, None)
         slot_idx = self._client_slots.get(client_id)
         if state is not None:
-            self._client_epochs[client_id] = max(
-                self._client_epochs.get(client_id, state.epoch),
+            request_epoch_key = self._request_epoch_key(client_id, state.request_id)
+            self._request_epochs[request_epoch_key] = max(
+                self._request_epochs.get(request_epoch_key, state.epoch),
                 state.epoch,
             )
             self._retire_request(
@@ -1196,7 +1203,11 @@ class DasdInferenceController:
             client_id=client_id,
             request_id=state.request_id if state is not None else None,
             slot_idx=slot_idx if state is None else state.slot_idx,
-            epoch=state.epoch if state is not None else self._client_epochs.get(client_id),
+            epoch=(
+                state.epoch
+                if state is not None
+                else None
+            ),
             prompt_len=state.prompt_len if state is not None else None,
             reason=reason,
         )
@@ -1252,6 +1263,11 @@ class DasdInferenceController:
         if retired_reason is not None and (
             active_state is None or active_state.request_id != request.request_id
         ):
+            self._dasd_debug_log(
+                "retired_request_drop",
+                request=request,
+                reason=retired_reason,
+            )
             return self._safe_reject_bundle(
                 request,
                 token_window,
@@ -1268,12 +1284,20 @@ class DasdInferenceController:
                 reason=f"terminal_failed:{terminal_reason}",
             )
 
-        current_epoch = self._client_epochs.get(request.client_id, -1)
+        current_epoch = self._request_epochs.get(
+            self._request_epoch_key(request.client_id, request.request_id), -1
+        )
         if (
             active_state is not None
             and active_state.request_id == request.request_id
             and request.epoch < current_epoch
         ):
+            self._dasd_debug_log(
+                "active_request_epoch_mismatch",
+                request=request,
+                state=active_state,
+                current_epoch=current_epoch,
+            )
             return self._safe_reject_bundle(
                 request,
                 token_window,
@@ -1313,7 +1337,9 @@ class DasdInferenceController:
             epoch=int(request.epoch),
             bundle_id=int(request.bundle_id),
         )
-        self._client_epochs[request.client_id] = state.epoch
+        self._request_epochs[
+            self._request_epoch_key(request.client_id, request.request_id)
+        ] = state.epoch
         if not self._is_valid_slot_idx(state.slot_idx):
             return self._safe_reject_bundle(
                 request,
@@ -1456,10 +1482,11 @@ class DasdInferenceController:
     ):
         state = self._slot_states.get(client_id)
 
-        previous_epoch = self._client_epochs.get(client_id, -1)
+        request_epoch_key = self._request_epoch_key(client_id, request_id)
+        previous_epoch = self._request_epochs.get(request_epoch_key, -1)
         if epoch < previous_epoch:
             raise RuntimeError(
-                f"stale epoch for client {client_id}: request epoch {epoch} < current {previous_epoch}"
+                f"stale epoch for active request {request_id} on client {client_id}: request epoch {epoch} < current {previous_epoch}"
             )
 
         if state is not None and state.request_id == request_id:
@@ -1481,7 +1508,7 @@ class DasdInferenceController:
                 return state
 
             state.epoch = epoch
-            self._client_epochs[client_id] = epoch
+            self._request_epochs[request_epoch_key] = epoch
             self._dasd_debug_log(
                 "epoch_transition_preserve_state",
                 client_id=client_id,
@@ -1527,7 +1554,7 @@ class DasdInferenceController:
                     reason="request_switch",
                 )
             self._dasd_debug_log(
-                "epoch_or_request_transition",
+                "request_switch_epoch_reset",
                 client_id=client_id,
                 request_id=request_id,
                 bundle_id=bundle_id,
@@ -1535,6 +1562,7 @@ class DasdInferenceController:
                 epoch=epoch,
                 state_epoch=state.epoch if state is not None else previous_epoch,
                 prev_request_id=state.request_id if state is not None else None,
+                previous_request_epoch=state.epoch if state is not None else None,
                 new_state=True,
                 reused_slot=True,
             )
@@ -1584,7 +1612,7 @@ class DasdInferenceController:
             next_token_id=next_token_id,
         )
         self._slot_states[client_id] = state
-        self._client_epochs[client_id] = epoch
+        self._request_epochs[request_epoch_key] = epoch
         self._dasd_debug_log(
             "state_created",
             client_id=client_id,

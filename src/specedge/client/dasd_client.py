@@ -232,6 +232,11 @@ class DasdRequestState:
     bundle_build_none_count: int = 0
     send_spawn_count: int = 0
     send_spawn_after_rebuild_count: int = 0
+    draft_regeneration_attempt_count: int = 0
+    draft_regeneration_success_count: int = 0
+    draft_regeneration_no_suffix_count: int = 0
+    recovery_resume_success_count: int = 0
+    recovery_resume_fail_count: int = 0
     sum_window_at_send: int = 0
     sum_tree_depth_at_send: int = 0
     sum_leaf_budget_at_send: int = 0

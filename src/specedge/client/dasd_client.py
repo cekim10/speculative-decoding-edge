@@ -159,6 +159,8 @@ class DasdCreditController:
 @dataclass
 class DasdTaskInfo:
     task: Any
+    request_id: str
+    bundle_id: int
     base_token_index: int
     token_ids: list[int]
     epoch_at_send: int
@@ -211,10 +213,17 @@ class DasdRequestState:
     recovery_mode_entries: int = 0
     failure_cache_hits: int = 0
     forced_commit_count: int = 0
+    invalid_token_abort_count: int = 0
+    stale_epoch_drop_count: int = 0
+    late_task_drop_count: int = 0
+    inflight_cleanup_count: int = 0
+    rpc_failure_count: int = 0
     sum_window_at_send: int = 0
     sum_tree_depth_at_send: int = 0
     sum_leaf_budget_at_send: int = 0
     finish_status: str = ""
+    cleanup_reason: str = ""
+    cleanup_induced_drain: bool = False
     base_retry_counts: dict[int, int] = field(default_factory=dict)
     failure_cache: dict[tuple[int, tuple[int, ...]], dict[int, DasdFailureCacheEntry]] = (
         field(default_factory=dict)

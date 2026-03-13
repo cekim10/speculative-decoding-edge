@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Optional
 
+import grpc
 import numpy as np
 import torch
 
@@ -86,6 +87,7 @@ class SpecExecClient:
             max_len=self._engine.max_len,
         )
         self._validator = GrpcClientController(host=config.host, device=self._device)
+        self._effective_vocab_size = self._resolve_effective_vocab_size()
 
         self._proactive_client: Optional[SpecExecProactiveDraft] = None
         if self._proactive_type != "disabled" and not self._dasd_enabled:
@@ -100,6 +102,174 @@ class SpecExecClient:
 
             # Whether Proactive Draft is executed in the current iter
             self._proactive_draft = False
+
+    def _resolve_effective_vocab_size(self):
+        # Prefer the model output dimension over tokenizer metadata because
+        # speculative draft tokens must be valid for the verifier logits space.
+        candidates: list[int] = []
+        output_embeddings = None
+        try:
+            output_embeddings = self._engine._model.get_output_embeddings()
+        except Exception:
+            output_embeddings = None
+        if output_embeddings is not None and getattr(output_embeddings, "weight", None) is not None:
+            candidates.append(int(output_embeddings.weight.size(0)))
+        lm_head = getattr(self._engine._model, "lm_head", None)
+        if lm_head is not None:
+            out_features = getattr(lm_head, "out_features", None)
+            if out_features is not None:
+                candidates.append(int(out_features))
+            elif getattr(lm_head, "weight", None) is not None:
+                candidates.append(int(lm_head.weight.size(0)))
+        model_vocab = getattr(getattr(self._engine._model, "config", None), "vocab_size", None)
+        if model_vocab is not None:
+            candidates.append(int(model_vocab))
+        tokenizer_vocab = getattr(self._tokenizer, "vocab_size", None)
+        if tokenizer_vocab is not None:
+            candidates.append(int(tokenizer_vocab))
+        try:
+            candidates.append(int(len(self._tokenizer)))
+        except Exception:
+            pass
+        return next((value for value in candidates if value > 0), None)
+
+    def _validate_dasd_token_ids(
+        self,
+        state: DasdRequestState,
+        token_ids: list[int],
+        source_path: str,
+        bundle_id: Optional[int] = None,
+        base_token_index: Optional[int] = None,
+    ):
+        vocab_size = self._effective_vocab_size
+        for raw_token_id in token_ids:
+            if not isinstance(raw_token_id, int):
+                self._logger.warning(
+                    "[DASD] invalid_token req=%s epoch=%d bundle=%s base=%s source=%s token_id=%r vocab_size=%s reason=non_int",
+                    state.request_id,
+                    state.epoch,
+                    bundle_id,
+                    base_token_index,
+                    source_path,
+                    raw_token_id,
+                    vocab_size,
+                )
+                return False
+            if raw_token_id < 0 or (vocab_size is not None and raw_token_id >= vocab_size):
+                self._logger.warning(
+                    "[DASD] invalid_token req=%s epoch=%d bundle=%s base=%s source=%s token_id=%d vocab_size=%s reason=out_of_range",
+                    state.request_id,
+                    state.epoch,
+                    bundle_id,
+                    base_token_index,
+                    source_path,
+                    raw_token_id,
+                    vocab_size,
+                )
+                return False
+        return True
+
+    def _schedule_invalid_token_abort(
+        self,
+        state: DasdRequestState,
+        source_path: str,
+        bundle_id: Optional[int] = None,
+        base_token_index: Optional[int] = None,
+    ):
+        state.invalid_token_abort_count += 1
+        state.aborted = True
+        state.abort_reason = "invalid_token_id"
+        state.finish_status = "explicit_abort_reason"
+        self._logger.warning(
+            "[DASD] invalid_token_abort req=%s epoch=%d bundle=%s base=%s source=%s",
+            state.request_id,
+            state.epoch,
+            bundle_id,
+            base_token_index,
+            source_path,
+        )
+        cleanup_task = asyncio.create_task(
+            self._abort_dasd_request(state, reason=state.abort_reason)
+        )
+        cleanup_task.add_done_callback(lambda _: None)
+
+    def _cancel_dasd_inflight(self, state: DasdRequestState, reason: str):
+        task_infos = list(state.inflight.values())
+        before_count = len(task_infos)
+        if before_count == 0:
+            return []
+
+        state.inflight_cleanup_count += 1
+        state.cleanup_reason = reason
+        state.cleanup_induced_drain = True
+        state.inflight.clear()
+        state.task_to_bundle.clear()
+        state.responses_by_base.clear()
+
+        for task_info in task_infos:
+            task_info.task.cancel()
+
+        if config.dasd_debug:
+            self._logger.info(
+                "[DASD] request_cleanup_start req=%s epoch=%d reason=%s inflight_before=%d inflight_after=%d",
+                state.request_id,
+                state.epoch,
+                reason,
+                before_count,
+                len(state.inflight),
+            )
+        return task_infos
+
+    async def _await_cancelled_dasd_tasks(
+        self,
+        state: DasdRequestState,
+        task_infos: list[DasdTaskInfo],
+        reason: str,
+    ):
+        if not task_infos:
+            return
+        results = await asyncio.gather(
+            *[task_info.task for task_info in task_infos],
+            return_exceptions=True,
+        )
+        late_drop_count = 0
+        for task_info, result in zip(task_infos, results):
+            if isinstance(result, asyncio.CancelledError):
+                continue
+            if isinstance(result, BaseException):
+                if isinstance(result, grpc.aio.AioRpcError) and result.code() == grpc.StatusCode.CANCELLED:
+                    continue
+                late_drop_count += 1
+                if config.dasd_debug:
+                    self._logger.info(
+                        "[DASD] late_task_dropped req=%s epoch=%d bundle=%d base=%d reason=%s outcome=%s",
+                        state.request_id,
+                        task_info.epoch_at_send,
+                        task_info.bundle_id,
+                        task_info.base_token_index,
+                        reason,
+                        type(result).__name__,
+                    )
+                continue
+            late_drop_count += 1
+            if config.dasd_debug:
+                self._logger.info(
+                    "[DASD] late_task_dropped req=%s epoch=%d bundle=%d base=%d reason=%s outcome=response",
+                    state.request_id,
+                    task_info.epoch_at_send,
+                    task_info.bundle_id,
+                    task_info.base_token_index,
+                    reason,
+                )
+        state.late_task_drop_count += late_drop_count
+        if config.dasd_debug:
+            self._logger.info(
+                "[DASD] request_cleanup_end req=%s epoch=%d reason=%s late_dropped=%d",
+                state.request_id,
+                state.epoch,
+                reason,
+                late_drop_count,
+            )
 
     def _verify_configs(self):
         if self._proactive_type not in ["included", "excluded", "disabled"]:
@@ -257,9 +427,18 @@ class SpecExecClient:
 
             await self._fill_inflight_for_dasd(state)
             if not state.inflight:
-                if not state.aborted:
+                if state.cleanup_induced_drain:
+                    self._logger.info(
+                        "[DASD] cleanup_drain req=%s epoch=%d reason=%s finish_status=%s aborted=%s",
+                        state.request_id,
+                        state.epoch,
+                        state.cleanup_reason,
+                        state.finish_status,
+                        state.aborted,
+                    )
+                elif not state.aborted:
                     self._logger.warning(
-                        "No inflight DASD bundle for req_idx=%d; stopping generation.",
+                        "No inflight DASD bundle for req_idx=%d; stopping generation as unexpected stall.",
                         req_idx,
                     )
                     finish_status = "stalled"
@@ -339,6 +518,11 @@ class SpecExecClient:
                 "recovery_mode_entries": state.recovery_mode_entries,
                 "failure_cache_hits": state.failure_cache_hits,
                 "forced_commit_count": state.forced_commit_count,
+                "invalid_token_abort_count": state.invalid_token_abort_count,
+                "stale_epoch_drop_count": state.stale_epoch_drop_count,
+                "late_task_drop_count": state.late_task_drop_count,
+                "inflight_cleanup_count": state.inflight_cleanup_count,
+                "rpc_failure_count": state.rpc_failure_count,
                 "average_W": (
                     state.sum_window_at_send / state.verify_rounds
                     if state.verify_rounds > 0
@@ -840,6 +1024,21 @@ class SpecExecClient:
                 state.finish_status = "explicit_abort_reason"
             self._exit_fallback_burst(state, reason=reason)
             return False
+        if not self._validate_dasd_token_ids(
+            state,
+            [token_id],
+            source_path="fallback_burst",
+            bundle_id=state.next_bundle_id - 1,
+            base_token_index=base_token_index,
+        ):
+            self._schedule_invalid_token_abort(
+                state,
+                source_path="fallback_burst",
+                bundle_id=state.next_bundle_id - 1,
+                base_token_index=base_token_index,
+            )
+            self._exit_fallback_burst(state, reason="invalid_token_id")
+            return False
 
         old_prefix_key = self._dasd_prefix_key(state)
         state.drafted_tokens = state.drafted_tokens[: state.committed_len]
@@ -926,6 +1125,20 @@ class SpecExecClient:
         token_id = int(getattr(response, "verifier_next_token_id", -1))
         if token_id < 0:
             return False
+        if not self._validate_dasd_token_ids(
+            state,
+            [token_id],
+            source_path="forced_commit",
+            bundle_id=task_info.bundle_id,
+            base_token_index=base_token_index,
+        ):
+            self._schedule_invalid_token_abort(
+                state,
+                source_path="forced_commit",
+                bundle_id=task_info.bundle_id,
+                base_token_index=base_token_index,
+            )
+            return False
         old_prefix_key = self._dasd_prefix_key(state)
 
         if config.dasd_debug:
@@ -946,16 +1159,18 @@ class SpecExecClient:
         )
         state.forced_commit_count += 1
         state.epoch += 1
-        cancelled_tasks = []
-        for inflight_info in state.inflight.values():
-            inflight_info.task.cancel()
-            cancelled_tasks.append(inflight_info.task)
-        if cancelled_tasks:
-            drain_task = asyncio.gather(*cancelled_tasks, return_exceptions=True)
+        cancelled_task_infos = self._cancel_dasd_inflight(
+            state, reason="forced_commit_cleanup"
+        )
+        if cancelled_task_infos:
+            drain_task = asyncio.create_task(
+                self._await_cancelled_dasd_tasks(
+                    state,
+                    cancelled_task_infos,
+                    reason="forced_commit_cleanup",
+                )
+            )
             drain_task.add_done_callback(lambda _: None)
-        state.inflight.clear()
-        state.task_to_bundle.clear()
-        state.responses_by_base.clear()
         state.drafted_tokens = state.drafted_tokens[: state.committed_len]
         state.drafted_tokens.append(token_id)
         state.committed_len += 1
@@ -1040,6 +1255,20 @@ class SpecExecClient:
         ]
         if len(token_ids) < state.window_size:
             return
+        if not self._validate_dasd_token_ids(
+            state,
+            token_ids,
+            source_path="bundle",
+            bundle_id=bundle_id,
+            base_token_index=base_token_index,
+        ):
+            self._schedule_invalid_token_abort(
+                state,
+                source_path="bundle",
+                bundle_id=bundle_id,
+                base_token_index=base_token_index,
+            )
+            return
 
         send_ts = time.perf_counter()
         task = asyncio.create_task(
@@ -1057,6 +1286,8 @@ class SpecExecClient:
 
         task_info = DasdTaskInfo(
             task=task,
+            request_id=state.request_id,
+            bundle_id=bundle_id,
             base_token_index=base_token_index,
             token_ids=token_ids,
             epoch_at_send=state.epoch,
@@ -1088,6 +1319,7 @@ class SpecExecClient:
         state.task_to_bundle[task] = bundle_id
         state.next_bundle_id += 1
         state.next_base_index += state.window_size
+        state.cleanup_induced_drain = False
         if config.dasd_debug:
             self._logger.info(
                 "[DASD] send req=%s bundle=%d epoch=%d base=%d base_retry=%d W=%d inflight=%d credit=%s tree_depth=%s leaf_budget=%s branch_width=%s tokens=%s",
@@ -1119,16 +1351,83 @@ class SpecExecClient:
 
             task_info = state.inflight.pop(bundle_id, None)
             if task_info is None:
+                state.late_task_drop_count += 1
+                if config.dasd_debug:
+                    self._logger.info(
+                        "[DASD] late_task_dropped req=%s epoch=%d bundle=%s reason=cleanup_missing_inflight",
+                        state.request_id,
+                        state.epoch,
+                        bundle_id,
+                    )
                 continue
 
             if task.cancelled():
+                state.late_task_drop_count += 1
+                if config.dasd_debug:
+                    self._logger.info(
+                        "[DASD] late_task_dropped req=%s epoch=%d bundle=%d base=%d reason=cancelled_after_cleanup",
+                        state.request_id,
+                        task_info.epoch_at_send,
+                        task_info.bundle_id,
+                        task_info.base_token_index,
+                    )
                 continue
 
             try:
                 response = task.result()
                 state.consecutive_rpc_failures = 0
+            except grpc.aio.AioRpcError as e:
+                status_code = e.code()
+                if status_code == grpc.StatusCode.CANCELLED:
+                    state.late_task_drop_count += 1
+                    if config.dasd_debug:
+                        self._logger.info(
+                            "[DASD] late_task_dropped req=%s epoch=%d bundle=%d base=%d reason=grpc_cancelled",
+                            state.request_id,
+                            task_info.epoch_at_send,
+                            task_info.bundle_id,
+                            task_info.base_token_index,
+                        )
+                    continue
+                state.consecutive_rpc_failures += 1
+                state.rpc_failure_count += 1
+                self._logger.warning(
+                    "DASD bundle RPC failed (req=%s, bundle=%d, base=%d, status=%s)",
+                    state.request_id,
+                    bundle_id,
+                    task_info.base_token_index,
+                    status_code.name,
+                )
+                if status_code == grpc.StatusCode.UNAVAILABLE:
+                    await self._abort_dasd_request(
+                        state,
+                        reason="rpc_unavailable",
+                    )
+                    return
+                if state.consecutive_rpc_failures >= config.dasd_abort_after_failures:
+                    await self._abort_dasd_request(
+                        state,
+                        reason=(
+                            "rpc_failures>="
+                            f"{config.dasd_abort_after_failures}"
+                        ),
+                    )
+                    return
+                response = SimpleNamespace(
+                    bundle_id=bundle_id,
+                    accepted_len=0,
+                    r_obs=0.0,
+                    next_credit=state.window_size,
+                    server_queue_delay_ms=0.0,
+                    server_service_ms=0.0,
+                    reject_reason=f"rpc_failure:{status_code.name}",
+                    verifier_poisoned=False,
+                    verifier_next_token_id=-1,
+                    forced_commit_eligible=False,
+                )
             except Exception:
                 state.consecutive_rpc_failures += 1
+                state.rpc_failure_count += 1
                 self._logger.exception(
                     "DASD bundle task failed (req=%s, bundle=%d, base=%d). Treating as full rejection.",
                     state.request_id,
@@ -1235,6 +1534,7 @@ class SpecExecClient:
             forced_commit_applied = False
             if accepted_len > 0:
                 self._exit_recovery_mode(state, reason="committed_progress")
+                state.cleanup_induced_drain = False
             elif (
                 config.dasd_recovery_mode_enabled
                 and (
@@ -1371,6 +1671,11 @@ class SpecExecClient:
                 abort_task.add_done_callback(lambda _: None)
                 return
 
+            if reject_reason.startswith("stale_epoch("):
+                state.stale_epoch_drop_count += 1
+            elif reject_reason.startswith("late_bundle_after_cleanup"):
+                state.late_task_drop_count += 1
+
             if (
                 accepted_len == 0
                 and state.consecutive_full_rejections
@@ -1398,18 +1703,18 @@ class SpecExecClient:
                 state.rollback_blocked_token_id = failed_first_token
                 state.epoch += 1
 
-                cancelled_tasks = []
-                for inflight_info in state.inflight.values():
-                    inflight_info.task.cancel()
-                    cancelled_tasks.append(inflight_info.task)
-                if cancelled_tasks:
-                    drain_task = asyncio.gather(
-                        *cancelled_tasks, return_exceptions=True
+                cancelled_task_infos = self._cancel_dasd_inflight(
+                    state, reason="rollback_cleanup"
+                )
+                if cancelled_task_infos:
+                    drain_task = asyncio.create_task(
+                        self._await_cancelled_dasd_tasks(
+                            state,
+                            cancelled_task_infos,
+                            reason="rollback_cleanup",
+                        )
                     )
                     drain_task.add_done_callback(lambda _: None)
-                state.inflight.clear()
-                state.task_to_bundle.clear()
-                state.responses_by_base.clear()
 
                 state.drafted_tokens = state.drafted_tokens[: state.committed_len]
                 state.next_base_index = state.committed_len
@@ -1440,14 +1745,12 @@ class SpecExecClient:
     async def _drain_dasd_inflight(self, state: DasdRequestState):
         if not state.inflight:
             return
-
-        pending_tasks = [info.task for info in state.inflight.values()]
-        for task in pending_tasks:
-            task.cancel()
-        await asyncio.gather(*pending_tasks, return_exceptions=True)
-        state.inflight.clear()
-        state.task_to_bundle.clear()
-        state.responses_by_base.clear()
+        task_infos = self._cancel_dasd_inflight(state, reason="request_finish_cleanup")
+        await self._await_cancelled_dasd_tasks(
+            state,
+            task_infos,
+            reason="request_finish_cleanup",
+        )
 
     async def _abort_dasd_request(self, state: DasdRequestState, reason: str):
         if state.aborted and not state.inflight:
@@ -1463,6 +1766,7 @@ class SpecExecClient:
             state.total_verified_tokens,
             state.total_accepted_tokens,
         )
+        state.finish_status = "explicit_abort_reason"
         await self._drain_dasd_inflight(state)
 
     def _draft_more_for_dasd(self, state: DasdRequestState, target_tokens: int):

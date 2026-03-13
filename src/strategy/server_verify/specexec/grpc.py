@@ -890,21 +890,55 @@ class DasdInferenceController:
         self._tokenizer = util.load_tokenizer(config.target_model)
         self._dataset = util.load_dataset(config.dataset, config.target_model)
         self._dasd_debug = getattr(config, "dasd_debug", False)
-        self._vocab_size = getattr(self._tokenizer, "vocab_size", None)
-        if self._vocab_size is None:
-            try:
-                self._vocab_size = len(self._tokenizer)
-            except TypeError:
-                self._vocab_size = None
+        self._vocab_size = self._resolve_effective_vocab_size()
 
         self._client_slots: dict[str, int] = {}
         self._client_epochs: dict[str, int] = {}
         self._slot_states: dict[str, DasdVerifierState] = {}
         self._terminal_failed_requests: dict[tuple[str, str, int], str] = {}
+        self._retired_requests: dict[tuple[str, str], str] = {}
         self._slot_cap = max(1, self._num_clients)
         self._available_slots = list(range(self._slot_cap))
         self._cuda_poisoned = False
         self._global_poison_reason = ""
+
+    def _resolve_effective_vocab_size(self):
+        candidates: list[int] = []
+        output_embeddings = None
+        try:
+            output_embeddings = self._model.get_output_embeddings()
+        except Exception:
+            output_embeddings = None
+        if output_embeddings is not None and getattr(output_embeddings, "weight", None) is not None:
+            candidates.append(int(output_embeddings.weight.size(0)))
+        lm_head = getattr(self._model, "lm_head", None)
+        if lm_head is not None:
+            out_features = getattr(lm_head, "out_features", None)
+            if out_features is not None:
+                candidates.append(int(out_features))
+            elif getattr(lm_head, "weight", None) is not None:
+                candidates.append(int(lm_head.weight.size(0)))
+        model_vocab = getattr(getattr(self._model, "config", None), "vocab_size", None)
+        if model_vocab is not None:
+            candidates.append(int(model_vocab))
+        tokenizer_vocab = getattr(self._tokenizer, "vocab_size", None)
+        if tokenizer_vocab is not None:
+            candidates.append(int(tokenizer_vocab))
+        try:
+            candidates.append(int(len(self._tokenizer)))
+        except Exception:
+            pass
+        return next((value for value in candidates if value > 0), None)
+
+    def _retire_request(self, client_id: str, request_id: str, reason: str):
+        key = (client_id, request_id)
+        self._retired_requests[key] = reason
+        self._dasd_debug_log(
+            "retire_request",
+            client_id=client_id,
+            request_id=request_id,
+            reason=reason,
+        )
 
     def loop(self):
         self._logger.debug("Starting DASD inference loop")
@@ -1146,6 +1180,11 @@ class DasdInferenceController:
                 self._client_epochs.get(client_id, state.epoch),
                 state.epoch,
             )
+            self._retire_request(
+                client_id=client_id,
+                request_id=state.request_id,
+                reason=reason,
+            )
         self._logger.warning(
             "Invalidating DASD state for client=%s slot_idx=%s reason=%s",
             client_id,
@@ -1207,6 +1246,17 @@ class DasdInferenceController:
     def _verify_bundle(self, request: specedge_pb2.VerifyBundleRequest):
         token_window = [int(token_id) for token_id in request.token_ids]
         self._dasd_debug_log("verify_start", request=request, token_window=token_window)
+
+        active_state = self._slot_states.get(request.client_id)
+        retired_reason = self._retired_requests.get((request.client_id, request.request_id))
+        if retired_reason is not None and (
+            active_state is None or active_state.request_id != request.request_id
+        ):
+            return self._safe_reject_bundle(
+                request,
+                token_window,
+                reason=f"late_bundle_after_cleanup:{retired_reason}",
+            )
 
         terminal_reason = self._terminal_failed_requests.get(
             self._terminal_request_key(request)
@@ -1466,6 +1516,12 @@ class DasdInferenceController:
                 f"DASD slot index {slot_idx} for client {client_id} is outside [0, {self._slot_cap - 1}]"
             )
         else:
+            if state is not None:
+                self._retire_request(
+                    client_id=client_id,
+                    request_id=state.request_id,
+                    reason="request_switch",
+                )
             self._dasd_debug_log(
                 "epoch_or_request_transition",
                 client_id=client_id,

@@ -56,10 +56,12 @@ async def main():
         _ = stub.Sync(specedge_pb2.SyncRequest())
 
     logger.info(
-        "Starting %s requests (max_request_num=%s, sample_req_cnt=%s)",
+        "Starting %s requests selected from dataset_size=%s using req_offset=%s, sample_req_cnt=%s, max_request_num=%s",
         len(req_indices),
-        config.max_request_num,
+        len(dataset),
+        config.req_offset,
         config.sample_req_cnt,
+        config.max_request_num,
     )
     for i, req_idx in enumerate(req_indices):
         logger.info("Request %s/%s, req_idx: %s", i + 1, len(req_indices), req_idx)

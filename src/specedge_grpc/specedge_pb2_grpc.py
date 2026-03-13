@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-import specedge_pb2 as specedge__pb2
+from specedge_grpc import specedge_pb2 as specedge__pb2
 
 GRPC_GENERATED_VERSION = '1.75.1'
 GRPC_VERSION = grpc.__version__

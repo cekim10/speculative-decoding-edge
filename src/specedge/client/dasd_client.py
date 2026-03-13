@@ -227,10 +227,18 @@ class DasdRequestState:
     unexpected_empty_inflight_recovery_count: int = 0
     unexpected_empty_inflight_recovery_fail_count: int = 0
     premature_stall_prevented_count: int = 0
+    refill_no_work_count: int = 0
+    refill_guard_block_count: int = 0
+    bundle_build_none_count: int = 0
+    send_spawn_count: int = 0
+    send_spawn_after_rebuild_count: int = 0
     sum_window_at_send: int = 0
     sum_tree_depth_at_send: int = 0
     sum_leaf_budget_at_send: int = 0
     finish_status: str = ""
+    last_refill_skip_reason: str = ""
+    last_recovery_failure_reason: str = ""
+    last_refill_phase: str = ""
     cleanup_reason: str = ""
     cleanup_induced_drain: bool = False
     base_retry_counts: dict[int, int] = field(default_factory=dict)

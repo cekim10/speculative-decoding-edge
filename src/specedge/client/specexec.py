@@ -217,6 +217,55 @@ class SpecExecClient:
                 state.aborted,
             )
 
+    def _log_refill_decision(
+        self,
+        state: DasdRequestState,
+        phase: str,
+        action: str,
+        reason: str,
+        **extra,
+    ):
+        state.last_refill_phase = phase
+        if action in {"skipped", "no_work", "guard_blocked", "fail"}:
+            state.last_refill_skip_reason = reason
+        if action == "fail":
+            state.last_recovery_failure_reason = reason
+        if action == "no_work":
+            state.refill_no_work_count += 1
+        if action in {"skipped", "guard_blocked"}:
+            state.refill_guard_block_count += 1
+
+        if not config.dasd_debug:
+            return
+
+        self._logger.info(
+            "[DASD] refill_decision req=%s epoch=%d phase=%s action=%s reason=%s committed_len=%d drafted_len=%d next_base_index=%d inflight_count=%d pending_response_count=%d active_task_count=%d credit=%s W=%d tree_depth=%s leaf_budget=%s recovery_mode_active=%s full_rejection_streak=%d same_base_retry_count=%d failure_cache_enabled=%s blocked_tokens=%s aborted=%s finish_status=%s max_new_tokens=%d %s",
+            state.request_id,
+            state.epoch,
+            phase,
+            action,
+            reason,
+            state.committed_len,
+            len(state.drafted_tokens),
+            state.next_base_index,
+            len(state.inflight),
+            len(state.responses_by_base),
+            len(state.task_to_bundle),
+            state.credit_controller.credit if state.credit_controller is not None else None,
+            state.window_size,
+            state.tree_budget.max_beam_len if state.tree_budget is not None else None,
+            state.tree_budget.max_budget if state.tree_budget is not None else None,
+            state.recovery_mode_active,
+            state.consecutive_full_rejections,
+            state.same_base_retry_count,
+            config.dasd_failure_cache_enabled,
+            sorted(self._blocked_tokens_for_prefix(state)),
+            state.aborted,
+            state.finish_status,
+            self._max_new_tokens,
+            " ".join(f"{key}={value}" for key, value in extra.items()),
+        )
+
     def _can_continue_dasd_generation(self, state: DasdRequestState):
         return (
             not state.aborted
@@ -225,10 +274,29 @@ class SpecExecClient:
         )
 
     def _prepare_dasd_refill_from_committed(self, state: DasdRequestState, reason: str):
+        before_next_base = state.next_base_index
+        before_drafted_len = len(state.drafted_tokens)
+        before_pending_responses = len(state.responses_by_base)
         state.next_base_index = state.committed_len
         state.drafted_tokens = state.drafted_tokens[: state.committed_len]
         state.responses_by_base.clear()
         state.cleanup_induced_drain = False
+        if (
+            before_next_base != state.next_base_index
+            or before_drafted_len != len(state.drafted_tokens)
+            or before_pending_responses > 0
+        ):
+            self._logger.info(
+                "[DASD] inconsistency_detected req=%s epoch=%d reason=%s before_next_base=%d after_next_base=%d before_drafted_len=%d after_drafted_len=%d pending_responses_before=%d correction_applied=True",
+                state.request_id,
+                state.epoch,
+                reason,
+                before_next_base,
+                state.next_base_index,
+                before_drafted_len,
+                len(state.drafted_tokens),
+                before_pending_responses,
+            )
         if config.dasd_debug:
             prefix_tail = state.drafted_tokens[max(0, state.committed_len - 8) : state.committed_len]
             blocked_tokens = sorted(self._blocked_tokens_for_prefix(state))
@@ -281,68 +349,39 @@ class SpecExecClient:
 
         for attempt_idx in range(1, bounded_attempts + 1):
             state.refill_attempt_count += 1
-            if config.dasd_debug:
-                self._logger.info(
-                    "[DASD] refill_attempt req=%s epoch=%d attempt=%d reason=%s committed=%d drafted=%d next_base=%d inflight=%d",
-                    state.request_id,
-                    state.epoch,
-                    attempt_idx,
-                    reason,
-                    state.committed_len,
-                    len(state.drafted_tokens),
-                    state.next_base_index,
-                    len(state.inflight),
-                )
+            self._log_refill_decision(
+                state,
+                phase=reason,
+                action="attempt",
+                reason=reason,
+                attempt=attempt_idx,
+            )
             self._prepare_dasd_refill_from_committed(state, reason=reason)
-            await self._fill_inflight_for_dasd(state)
+            refill_result = await self._fill_inflight_for_dasd(state, phase=reason)
             if state.inflight:
                 state.refill_success_count += 1
                 if reason == "unexpected_empty_inflight":
                     state.premature_stall_prevented_count += 1
-                    if config.dasd_debug:
-                        self._logger.info(
-                            "[DASD] unexpected_empty_inflight_recovery_success req=%s epoch=%d committed=%d inflight=%d",
-                            state.request_id,
-                            state.epoch,
-                            state.committed_len,
-                            len(state.inflight),
-                        )
-                if config.dasd_debug:
-                    self._logger.info(
-                        "[DASD] refill_scheduled req=%s epoch=%d attempt=%d reason=%s inflight=%d next_base=%d",
-                        state.request_id,
-                        state.epoch,
-                        attempt_idx,
-                        reason,
-                        len(state.inflight),
-                        state.next_base_index,
-                    )
+                self._log_refill_decision(
+                    state,
+                    phase=reason,
+                    action="success",
+                    reason="send_spawned",
+                    attempt=attempt_idx,
+                    send_spawn_count=refill_result.get("send_spawn_count", 0),
+                )
                 return True
 
         state.refill_skip_count += 1
         if reason == "unexpected_empty_inflight":
             state.unexpected_empty_inflight_recovery_fail_count += 1
-            if config.dasd_debug:
-                self._logger.info(
-                    "[DASD] unexpected_empty_inflight_recovery_fail req=%s epoch=%d committed=%d drafted=%d next_base=%d inflight=%d",
-                    state.request_id,
-                    state.epoch,
-                    state.committed_len,
-                    len(state.drafted_tokens),
-                    state.next_base_index,
-                    len(state.inflight),
-                )
-        if config.dasd_debug:
-            self._logger.info(
-                "[DASD] refill_skipped req=%s epoch=%d reason=%s committed=%d drafted=%d next_base=%d inflight=%d",
-                state.request_id,
-                state.epoch,
-                reason,
-                state.committed_len,
-                len(state.drafted_tokens),
-                state.next_base_index,
-                len(state.inflight),
-            )
+        self._log_refill_decision(
+            state,
+            phase=reason,
+            action="fail",
+            reason=state.last_refill_skip_reason or "recovery_attempt_limit_reached",
+            attempts=bounded_attempts,
+        )
         return False
 
     def _cancel_dasd_inflight(self, state: DasdRequestState, reason: str):
@@ -581,7 +620,7 @@ class SpecExecClient:
                         break
                     continue
 
-            await self._fill_inflight_for_dasd(state)
+            await self._fill_inflight_for_dasd(state, phase="normal_refill")
             if not state.inflight:
                 if self._can_continue_dasd_generation(state):
                     refill_reason = (
@@ -604,6 +643,17 @@ class SpecExecClient:
                     )
                     if recovered:
                         continue
+                    self._logger.warning(
+                        "[DASD] recovery_failed req=%s epoch=%d reason=%s last_refill_skip_reason=%s last_recovery_failure_reason=%s refill_attempts=%d send_spawn_count=%d send_spawn_after_rebuild_count=%d",
+                        state.request_id,
+                        state.epoch,
+                        refill_reason,
+                        state.last_refill_skip_reason,
+                        state.last_recovery_failure_reason,
+                        state.refill_attempt_count,
+                        state.send_spawn_count,
+                        state.send_spawn_after_rebuild_count,
+                    )
                     state.unexpected_stall_count += 1
                     await self._abort_dasd_request(
                         state,
@@ -700,6 +750,14 @@ class SpecExecClient:
                 "unexpected_empty_inflight_recovery_count": state.unexpected_empty_inflight_recovery_count,
                 "unexpected_empty_inflight_recovery_fail_count": state.unexpected_empty_inflight_recovery_fail_count,
                 "premature_stall_prevented_count": state.premature_stall_prevented_count,
+                "last_refill_skip_reason": state.last_refill_skip_reason,
+                "last_recovery_failure_reason": state.last_recovery_failure_reason,
+                "last_refill_phase": state.last_refill_phase,
+                "refill_no_work_count": state.refill_no_work_count,
+                "refill_guard_block_count": state.refill_guard_block_count,
+                "bundle_build_none_count": state.bundle_build_none_count,
+                "send_spawn_count": state.send_spawn_count,
+                "send_spawn_after_rebuild_count": state.send_spawn_after_rebuild_count,
                 "average_W": (
                     state.sum_window_at_send / state.verify_rounds
                     if state.verify_rounds > 0
@@ -1389,9 +1447,15 @@ class SpecExecClient:
             )
         return True
 
-    async def _fill_inflight_for_dasd(self, state: DasdRequestState):
+    async def _fill_inflight_for_dasd(self, state: DasdRequestState, phase: str = "send_loop"):
         if state.aborted:
-            return
+            self._log_refill_decision(
+                state,
+                phase=phase,
+                action="skipped",
+                reason="request_aborted",
+            )
+            return {"reason": "request_aborted", "send_spawn_count": 0}
         if state.committed_len > len(state.drafted_tokens):
             self._logger.warning(
                 "[DASD] state_inconsistency req=%s epoch=%d reason=committed_gt_drafted committed=%d drafted=%d",
@@ -1401,6 +1465,12 @@ class SpecExecClient:
                 len(state.drafted_tokens),
             )
             state.drafted_tokens = state.drafted_tokens[: state.committed_len]
+            self._log_refill_decision(
+                state,
+                phase=phase,
+                action="guard_blocked",
+                reason="committed_len_gt_drafted_corrected",
+            )
         if state.next_base_index < state.committed_len:
             self._logger.warning(
                 "[DASD] state_inconsistency req=%s epoch=%d reason=next_base_lt_committed next_base=%d committed=%d",
@@ -1410,15 +1480,33 @@ class SpecExecClient:
                 state.committed_len,
             )
             state.next_base_index = state.committed_len
+            self._log_refill_decision(
+                state,
+                phase=phase,
+                action="guard_blocked",
+                reason="next_base_before_committed_corrected",
+            )
+        if len(state.inflight) >= config.dasd_max_inflight_bundles:
+            self._log_refill_decision(
+                state,
+                phase=phase,
+                action="skipped",
+                reason="max_inflight_reached",
+            )
+            return {"reason": "max_inflight_reached", "send_spawn_count": 0}
+        send_spawn_count = 0
+        last_reason = "unknown_guard_blocked"
         while len(state.inflight) < config.dasd_max_inflight_bundles:
             required_end = state.next_base_index + state.window_size
             if required_end > len(state.drafted_tokens):
                 if state.speculative_tokens() >= config.dasd_max_spec_buffer_tokens:
+                    last_reason = "send_budget_exhausted"
                     break
                 remaining_capacity = (
                     config.dasd_max_spec_buffer_tokens - state.speculative_tokens()
                 )
                 if remaining_capacity <= 0:
+                    last_reason = "send_budget_exhausted"
                     break
                 target_tokens = min(
                     remaining_capacity,
@@ -1428,14 +1516,57 @@ class SpecExecClient:
                         config.dasd_max_inflight_bundles - len(state.inflight),
                     ),
                 )
+                before_drafted_len = len(state.drafted_tokens)
                 self._draft_more_for_dasd(state, target_tokens)
                 required_end = state.next_base_index + state.window_size
+                if len(state.drafted_tokens) == before_drafted_len:
+                    state.bundle_build_none_count += 1
+                    last_reason = "bundle_build_returned_none"
+                    self._log_refill_decision(
+                        state,
+                        phase=phase,
+                        action="no_work",
+                        reason=last_reason,
+                    )
+                    break
                 if required_end > len(state.drafted_tokens):
+                    state.bundle_build_none_count += 1
+                    last_reason = "next_base_past_drafted"
+                    self._log_refill_decision(
+                        state,
+                        phase=phase,
+                        action="no_work",
+                        reason=last_reason,
+                    )
                     break
 
-            await self._send_bundle_for_dasd(state)
+            sent, send_reason = await self._send_bundle_for_dasd(state, phase=phase)
+            last_reason = send_reason
+            if sent:
+                send_spawn_count += 1
+                state.send_spawn_count += 1
+                if phase != "send_loop":
+                    state.send_spawn_after_rebuild_count += 1
+                self._log_refill_decision(
+                    state,
+                    phase=phase,
+                    action="scheduled",
+                    reason="send_spawned",
+                    send_spawn_count=send_spawn_count,
+                )
+            elif send_reason != "request_aborted":
+                self._log_refill_decision(
+                    state,
+                    phase=phase,
+                    action="skipped",
+                    reason=send_reason,
+                )
+                break
+        if send_spawn_count == 0:
+            return {"reason": last_reason, "send_spawn_count": 0}
+        return {"reason": "send_spawned", "send_spawn_count": send_spawn_count}
 
-    async def _send_bundle_for_dasd(self, state: DasdRequestState):
+    async def _send_bundle_for_dasd(self, state: DasdRequestState, phase: str = "send_loop"):
         if state.aborted:
             if config.dasd_debug:
                 self._logger.info(
@@ -1443,7 +1574,7 @@ class SpecExecClient:
                     state.request_id,
                     state.epoch,
                 )
-            return
+            return False, "request_inactive"
         bundle_id = state.next_bundle_id
         base_token_index = state.next_base_index
         state.base_retry_counts[base_token_index] = (
@@ -1455,7 +1586,8 @@ class SpecExecClient:
             base_token_index : base_token_index + state.window_size
         ]
         if len(token_ids) < state.window_size:
-            return
+            state.bundle_build_none_count += 1
+            return False, "drafted_len_not_ahead_of_committed"
         if not self._validate_dasd_token_ids(
             state,
             token_ids,
@@ -1469,7 +1601,7 @@ class SpecExecClient:
                 bundle_id=bundle_id,
                 base_token_index=base_token_index,
             )
-            return
+            return False, "invalid_token_id"
 
         send_ts = time.perf_counter()
         task = asyncio.create_task(
@@ -1537,6 +1669,7 @@ class SpecExecClient:
                 task_info.branch_width_at_send,
                 token_ids,
             )
+        return True, "send_spawned"
 
     async def _receive_one_round_for_dasd(self, state: DasdRequestState):
         if state.aborted or not state.inflight:

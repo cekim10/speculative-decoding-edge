@@ -186,6 +186,36 @@ class SpecEdgeClientConfig(metaclass=_ConfigMeta):
         cls.dasd_max_leaf_budget = int(
             os.getenv("SPECEDGE_DASD_MAX_LEAF_BUDGET", str(cls.max_budget))
         )
+        cls.dasd_failure_cache_enabled = (
+            os.getenv("SPECEDGE_DASD_FAILURE_CACHE_ENABLED", "False") == "True"
+        )
+        cls.dasd_failure_cache_cooldown = int(
+            os.getenv("SPECEDGE_DASD_FAILURE_CACHE_COOLDOWN", "3")
+        )
+        cls.dasd_failure_cache_max_tokens_per_prefix = int(
+            os.getenv("SPECEDGE_DASD_FAILURE_CACHE_MAX_TOKENS_PER_PREFIX", "4")
+        )
+        cls.dasd_recovery_mode_enabled = (
+            os.getenv("SPECEDGE_DASD_RECOVERY_MODE_ENABLED", "False") == "True"
+        )
+        cls.dasd_recovery_full_rejection_threshold = int(
+            os.getenv("SPECEDGE_DASD_RECOVERY_FULL_REJECTION_THRESHOLD", "3")
+        )
+        cls.dasd_recovery_same_base_retry_threshold = int(
+            os.getenv("SPECEDGE_DASD_RECOVERY_SAME_BASE_RETRY_THRESHOLD", "3")
+        )
+        cls.dasd_recovery_mode_rounds = int(
+            os.getenv("SPECEDGE_DASD_RECOVERY_MODE_ROUNDS", "2")
+        )
+        cls.dasd_recovery_forced_w = int(
+            os.getenv("SPECEDGE_DASD_RECOVERY_FORCED_W", "1")
+        )
+        cls.dasd_recovery_forced_tree_depth = int(
+            os.getenv("SPECEDGE_DASD_RECOVERY_FORCED_TREE_DEPTH", "1")
+        )
+        cls.dasd_recovery_forced_leaf_budget = int(
+            os.getenv("SPECEDGE_DASD_RECOVERY_FORCED_LEAF_BUDGET", "2")
+        )
         cls.dasd_debug = os.getenv("SPECEDGE_DASD_DEBUG", "False") == "True"
 
         cls._initialized = True

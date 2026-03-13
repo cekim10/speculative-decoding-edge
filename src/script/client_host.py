@@ -168,6 +168,36 @@ def main(config_file: str):
                 "SPECEDGE_DASD_MAX_LEAF_BUDGET": dasd_cfg.get(
                     "max_leaf_budget", max_budget
                 ),
+                "SPECEDGE_DASD_FAILURE_CACHE_ENABLED": dasd_cfg.get(
+                    "failure_cache_enabled", False
+                ),
+                "SPECEDGE_DASD_FAILURE_CACHE_COOLDOWN": dasd_cfg.get(
+                    "failure_cache_cooldown", 3
+                ),
+                "SPECEDGE_DASD_FAILURE_CACHE_MAX_TOKENS_PER_PREFIX": dasd_cfg.get(
+                    "failure_cache_max_tokens_per_prefix", 4
+                ),
+                "SPECEDGE_DASD_RECOVERY_MODE_ENABLED": dasd_cfg.get(
+                    "recovery_mode_enabled", False
+                ),
+                "SPECEDGE_DASD_RECOVERY_FULL_REJECTION_THRESHOLD": dasd_cfg.get(
+                    "recovery_full_rejection_threshold", 3
+                ),
+                "SPECEDGE_DASD_RECOVERY_SAME_BASE_RETRY_THRESHOLD": dasd_cfg.get(
+                    "recovery_same_base_retry_threshold", 3
+                ),
+                "SPECEDGE_DASD_RECOVERY_MODE_ROUNDS": dasd_cfg.get(
+                    "recovery_mode_rounds", 2
+                ),
+                "SPECEDGE_DASD_RECOVERY_FORCED_W": dasd_cfg.get(
+                    "recovery_forced_w", 1
+                ),
+                "SPECEDGE_DASD_RECOVERY_FORCED_TREE_DEPTH": dasd_cfg.get(
+                    "recovery_forced_tree_depth", 1
+                ),
+                "SPECEDGE_DASD_RECOVERY_FORCED_LEAF_BUDGET": dasd_cfg.get(
+                    "recovery_forced_leaf_budget", 2
+                ),
                 "SPECEDGE_DASD_DEBUG": dasd_cfg.get("debug", False),
             }
 

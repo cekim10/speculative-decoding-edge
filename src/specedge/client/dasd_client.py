@@ -3,6 +3,13 @@ from typing import Any, Optional
 
 
 @dataclass
+class DasdFailureCacheEntry:
+    token_id: int
+    blocked_until_round: int
+    hits: int = 1
+
+
+@dataclass
 class DasdTreeBudget:
     max_beam_len: int
     max_budget: int
@@ -196,6 +203,24 @@ class DasdRequestState:
     rollback_blocked_token_id: Optional[int] = None
     credit_controller: DasdCreditController | None = None
     tree_budget: DasdTreeBudget | None = None
+    verify_rounds: int = 0
+    full_rejection_count: int = 0
+    max_full_rejection_streak: int = 0
+    stall_rounds: int = 0
+    same_base_retry_count: int = 0
+    recovery_mode_entries: int = 0
+    failure_cache_hits: int = 0
+    sum_window_at_send: int = 0
+    sum_tree_depth_at_send: int = 0
+    sum_leaf_budget_at_send: int = 0
+    finish_status: str = ""
+    base_retry_counts: dict[int, int] = field(default_factory=dict)
+    failure_cache: dict[tuple[int, tuple[int, ...]], dict[int, DasdFailureCacheEntry]] = (
+        field(default_factory=dict)
+    )
+    recovery_mode_active: bool = False
+    recovery_mode_rounds_left: int = 0
+    recovery_mode_reason: str = ""
 
     def speculative_tokens(self):
         return max(0, len(self.drafted_tokens) - self.committed_len)

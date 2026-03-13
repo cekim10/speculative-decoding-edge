@@ -60,6 +60,16 @@ dasd:
   max_tree_depth: 4
   min_leaf_budget: 4
   max_leaf_budget: 32
+  failure_cache_enabled: false
+  failure_cache_cooldown: 3
+  failure_cache_max_tokens_per_prefix: 4
+  recovery_mode_enabled: false
+  recovery_full_rejection_threshold: 3
+  recovery_same_base_retry_threshold: 3
+  recovery_mode_rounds: 2
+  recovery_forced_w: 1
+  recovery_forced_tree_depth: 1
+  recovery_forced_leaf_budget: 2
   global_budget_C_total: 0
   ema_decay: 0.9
   debug: false

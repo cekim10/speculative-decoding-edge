@@ -296,6 +296,7 @@ class DasdRequestState:
     last_suffix_refresh_reason: str = ""
     last_cooldown_reason: str = ""
     last_retry_quality_reason: str = ""
+    suffix_refresh_anchor: tuple[int, int] | None = None
     cleanup_reason: str = ""
     cleanup_induced_drain: bool = False
     base_retry_counts: dict[int, int] = field(default_factory=dict)

@@ -568,6 +568,8 @@ class SpecExecClient:
         )
 
     def _prepare_dasd_refill_from_committed(self, state: DasdRequestState, reason: str):
+        if reason != "suffix_refresh":
+            state.suffix_refresh_anchor = None
         before_next_base = state.next_base_index
         before_drafted_len = len(state.drafted_tokens)
         before_pending_responses = len(state.responses_by_base)
@@ -634,6 +636,34 @@ class SpecExecClient:
                 len(state.inflight),
                 len(state.responses_by_base),
                 prefix_tail,
+            )
+
+    def _prepare_dasd_suffix_refresh_state(self, state: DasdRequestState, reason: str):
+        anchor = (state.epoch, state.committed_len)
+        if state.suffix_refresh_anchor != anchor:
+            self._prepare_dasd_refill_from_committed(state, reason="suffix_refresh")
+            state.suffix_refresh_anchor = anchor
+            return
+
+        before_next_base = state.next_base_index
+        before_pending_responses = len(state.responses_by_base)
+        if state.next_base_index < state.committed_len:
+            state.next_base_index = state.committed_len
+        if state.responses_by_base:
+            state.responses_by_base.clear()
+        if (
+            before_next_base != state.next_base_index
+            or before_pending_responses > 0
+        ):
+            self._logger.info(
+                "[DASD] inconsistency_detected req=%s epoch=%d reason=%s before_next_base=%d after_next_base=%d drafted_len=%d pending_responses_before=%d correction_applied=True",
+                state.request_id,
+                state.epoch,
+                reason,
+                before_next_base,
+                state.next_base_index,
+                len(state.drafted_tokens),
+                before_pending_responses,
             )
 
     def _regenerate_dasd_suffix(
@@ -739,7 +769,7 @@ class SpecExecClient:
             decision_reason=reason,
             base_token_index=state.committed_len,
         )
-        self._prepare_dasd_refill_from_committed(state, reason="suffix_refresh")
+        self._prepare_dasd_suffix_refresh_state(state, reason=reason)
         regenerated, regen_reason = self._regenerate_dasd_suffix(
             state,
             min_required_end=state.next_base_index + state.window_size,
@@ -1930,6 +1960,7 @@ class SpecExecClient:
         state.drafted_tokens.append(token_id)
         state.committed_len += 1
         state.next_base_index = state.committed_len
+        state.suffix_refresh_anchor = None
         state.consecutive_full_rejections = 0
         state.rollback_blocked_committed_len = None
         state.rollback_blocked_token_id = None
@@ -2092,6 +2123,7 @@ class SpecExecClient:
         state.drafted_tokens.append(token_id)
         state.committed_len += 1
         state.next_base_index = state.committed_len
+        state.suffix_refresh_anchor = None
         state.consecutive_full_rejections = 0
         state.rollback_blocked_committed_len = None
         state.rollback_blocked_token_id = None
@@ -2657,6 +2689,8 @@ class SpecExecClient:
             state.total_verified_tokens += verified_len
             state.total_accepted_tokens += accepted_len
             state.committed_len += accepted_len
+            if accepted_len > 0:
+                state.suffix_refresh_anchor = None
             assert state.committed_len >= prev_committed
             lifecycle = self._ensure_base_lifecycle(state, prev_committed)
             lifecycle["accepted_tokens_accumulated"] += accepted_len

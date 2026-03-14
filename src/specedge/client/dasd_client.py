@@ -291,6 +291,13 @@ class DasdRequestState:
     same_base_retry_short_circuit_count: int = 0
     cheap_recovery_success_count: int = 0
     expensive_recovery_count: int = 0
+    suppressed_retry_loop_count: int = 0
+    suppressed_retry_loop_break_count: int = 0
+    suppressed_retry_loop_escalation_count: int = 0
+    suppressed_retry_last_committed_len: int | None = None
+    suppressed_retry_last_fingerprint: tuple[int, ...] | None = None
+    suppressed_retry_last_blocked_tokens: tuple[int, ...] | None = None
+    last_suppressed_retry_reason: str = ""
     sum_window_at_send: int = 0
     sum_tree_depth_at_send: int = 0
     sum_leaf_budget_at_send: int = 0

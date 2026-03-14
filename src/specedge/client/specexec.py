@@ -681,6 +681,72 @@ class SpecExecClient:
     def _clear_suffix_refresh_anchor(self, state: DasdRequestState):
         state.suffix_refresh_anchor_committed_len = None
 
+    def _reset_suppressed_retry_loop_state(self, state: DasdRequestState, reason: str):
+        state.suppressed_retry_loop_count = 0
+        state.suppressed_retry_last_committed_len = None
+        state.suppressed_retry_last_fingerprint = None
+        state.suppressed_retry_last_blocked_tokens = None
+        state.last_suppressed_retry_reason = reason
+
+    def _record_suppressed_retry_loop(
+        self,
+        state: DasdRequestState,
+        *,
+        base_token_index: int,
+        token_ids: list[int],
+        retry_quality_reason: str,
+    ) -> tuple[int, bool]:
+        fingerprint = self._retry_fingerprint(state, base_token_index, token_ids)
+        blocked_tokens = tuple(sorted(self._compute_blocked_tokens_for_prefix(state)))
+        signature_changed = not (
+            state.suppressed_retry_last_committed_len == state.committed_len
+            and state.suppressed_retry_last_fingerprint == fingerprint
+            and state.suppressed_retry_last_blocked_tokens == blocked_tokens
+        )
+        if signature_changed:
+            state.suppressed_retry_loop_count = 1
+            state.suppressed_retry_last_committed_len = state.committed_len
+            state.suppressed_retry_last_fingerprint = fingerprint
+            state.suppressed_retry_last_blocked_tokens = blocked_tokens
+        else:
+            state.suppressed_retry_loop_count += 1
+        state.last_suppressed_retry_reason = retry_quality_reason
+        return state.suppressed_retry_loop_count, signature_changed
+
+    def _should_escalate_suppressed_retry_loop(
+        self,
+        state: DasdRequestState,
+        *,
+        retry_quality_reason: str,
+    ) -> bool:
+        return state.suppressed_retry_loop_count >= 2
+
+    def _has_sendable_novel_frontier_after_refresh(
+        self,
+        state: DasdRequestState,
+    ) -> tuple[bool, str]:
+        if state.frontier_sync_active and state.next_base_index != state.committed_len:
+            return False, "frontier_sync_base_mismatch_after_refresh"
+        if len(state.drafted_tokens) < state.next_base_index + state.window_size:
+            return False, "next_base_past_drafted_after_refresh"
+        candidate = state.drafted_tokens[
+            state.next_base_index : state.next_base_index + state.window_size
+        ]
+        if not candidate:
+            return False, "empty_candidate_after_refresh"
+        blocked_tokens = self._compute_blocked_tokens_for_prefix(state)
+        if candidate and candidate[0] in blocked_tokens:
+            return False, "frontier_token_blocked_after_refresh"
+        if not self._validate_dasd_token_ids(
+            state,
+            candidate,
+            source_path="suffix_refresh_check",
+            bundle_id=state.next_bundle_id,
+            base_token_index=state.next_base_index,
+        ):
+            return False, "invalid_candidate_after_refresh"
+        return True, "sendable_after_refresh"
+
     def _prepare_dasd_refill_from_committed(self, state: DasdRequestState, reason: str):
         before_next_base = state.next_base_index
         before_drafted_len = len(state.drafted_tokens)
@@ -913,6 +979,24 @@ class SpecExecClient:
             phase="suffix_refresh",
         )
         if regenerated:
+            sendable_after_refresh, frontier_reason = (
+                self._has_sendable_novel_frontier_after_refresh(state)
+            )
+            if not sendable_after_refresh:
+                state.suffix_refresh_fail_count += 1
+                self._log_dasd_state_event(
+                    "suffix_refresh_end",
+                    state,
+                    decision_reason=frontier_reason,
+                    base_token_index=state.committed_len,
+                )
+                self._log_dasd_state_event(
+                    "suffix_refresh_fail",
+                    state,
+                    decision_reason=frontier_reason,
+                    base_token_index=state.committed_len,
+                )
+                return False, frontier_reason
             state.suffix_refresh_success_count += 1
             state.rollback_cleanup_avoided_count += 1
             state.cheap_recovery_success_count += 1
@@ -1259,6 +1343,7 @@ class SpecExecClient:
             "Generated sequence: \n%s",
             self._tokenizer.decode(self._prefix_tokens[0], skip_special_tokens=True),
         )
+        self._reset_suppressed_retry_loop_state(state, reason=finish_status)
         await self._validator.close()
 
     async def _cycle(self, req_idx: int, step_idx: int, prefill=False) -> torch.Tensor:
@@ -1561,6 +1646,10 @@ class SpecExecClient:
                 "same_base_retry_short_circuit_count": state.same_base_retry_short_circuit_count,
                 "cheap_recovery_success_count": state.cheap_recovery_success_count,
                 "expensive_recovery_count": state.expensive_recovery_count,
+                "suppressed_retry_loop_count": state.suppressed_retry_loop_count,
+                "suppressed_retry_loop_break_count": state.suppressed_retry_loop_break_count,
+                "suppressed_retry_loop_escalation_count": state.suppressed_retry_loop_escalation_count,
+                "last_suppressed_retry_reason": state.last_suppressed_retry_reason,
                 "last_rollback_cause": state.last_rollback_cause,
                 "last_retry_decision_reason": state.last_retry_decision_reason,
                 "last_recovery_mode_transition_reason": state.last_recovery_mode_transition_reason,
@@ -2141,6 +2230,7 @@ class SpecExecClient:
         state.committed_len += 1
         state.next_base_index = state.committed_len
         self._clear_suffix_refresh_anchor(state)
+        self._reset_suppressed_retry_loop_state(state, reason="fallback_burst_progress")
         state.consecutive_full_rejections = 0
         state.rollback_blocked_committed_len = None
         state.rollback_blocked_token_id = None
@@ -2305,6 +2395,7 @@ class SpecExecClient:
         state.committed_len += 1
         state.next_base_index = state.committed_len
         self._clear_suffix_refresh_anchor(state)
+        self._reset_suppressed_retry_loop_state(state, reason="forced_commit_progress")
         state.consecutive_full_rejections = 0
         state.rollback_blocked_committed_len = None
         state.rollback_blocked_token_id = None
@@ -2489,6 +2580,52 @@ class SpecExecClient:
                 if state.frontier_sync_active:
                     break
             elif send_reason == "low_value_retry_suppressed":
+                base_token_index = state.next_base_index
+                current_candidate = state.drafted_tokens[
+                    base_token_index : base_token_index + state.window_size
+                ]
+                retry_quality_reason = (
+                    state.last_retry_quality_reason or send_reason
+                )
+                loop_count, signature_changed = self._record_suppressed_retry_loop(
+                    state,
+                    base_token_index=base_token_index,
+                    token_ids=current_candidate,
+                    retry_quality_reason=retry_quality_reason,
+                )
+                self._log_dasd_state_event(
+                    "suppressed_retry_loop_state",
+                    state,
+                    decision_reason=retry_quality_reason,
+                    base_token_index=base_token_index,
+                    blocked_tokens=sorted(self._compute_blocked_tokens_for_prefix(state)),
+                    loop_count=loop_count,
+                    signature_changed=signature_changed,
+                )
+                if self._should_escalate_suppressed_retry_loop(
+                    state,
+                    retry_quality_reason=retry_quality_reason,
+                ):
+                    state.suppressed_retry_loop_break_count += 1
+                    state.suppressed_retry_loop_escalation_count += 1
+                    state.last_mitigation_decision_reason = "suppressed_retry_no_op_loop"
+                    self._log_dasd_state_event(
+                        "suppressed_retry_loop_break",
+                        state,
+                        decision_reason="suppressed_retry_no_op_loop",
+                        base_token_index=base_token_index,
+                        blocked_tokens=sorted(self._compute_blocked_tokens_for_prefix(state)),
+                        loop_count=loop_count,
+                        signature_changed=signature_changed,
+                    )
+                    last_reason = "suppressed_retry_no_op_loop"
+                    self._log_refill_decision(
+                        state,
+                        phase=phase,
+                        action="no_work",
+                        reason=last_reason,
+                    )
+                    break
                 state.rollback_cleanup_deferred_count += 1
                 state.last_mitigation_decision_reason = send_reason
                 self._log_dasd_state_event(
@@ -2688,6 +2825,7 @@ class SpecExecClient:
         state.next_bundle_id += 1
         state.next_base_index += state.window_size
         state.cleanup_induced_drain = False
+        self._reset_suppressed_retry_loop_state(state, reason="send_spawned")
         if state.cleanup_reason == "rollback_cleanup" and not state.frontier_sync_active:
             self._enter_frontier_sync(state, reason="rollback_cleanup_resume")
             state.frontier_sync_resume_count += 1
@@ -2940,6 +3078,7 @@ class SpecExecClient:
             state.committed_len += accepted_len
             if accepted_len > 0:
                 self._clear_suffix_refresh_anchor(state)
+                self._reset_suppressed_retry_loop_state(state, reason="committed_progress")
                 self._record_frontier_sync_progress(
                     state,
                     reason="committed_progress",
@@ -3253,6 +3392,10 @@ class SpecExecClient:
 
                 state.expensive_recovery_count += 1
                 self._clear_suffix_refresh_anchor(state)
+                self._reset_suppressed_retry_loop_state(
+                    state,
+                    reason="rollback_cleanup_escalated",
+                )
                 self._prepare_dasd_refill_from_committed(
                     state, reason="rollback_cleanup"
                 )

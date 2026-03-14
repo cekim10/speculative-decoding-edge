@@ -933,6 +933,8 @@ class SpecExecClient:
         state.frontier_local_tiny_rebuild_last_committed_len = None
         state.frontier_local_tiny_rebuild_last_blocked_token_id = None
         state.frontier_local_tiny_rebuild_last_distinct_signature = None
+        state.frontier_local_tiny_rebuild_root_child_last_signature = None
+        state.frontier_local_tiny_rebuild_root_child_last_reason = reason
 
     def _get_frontier_blocked_token_id(self, state: DasdRequestState):
         base_token_index = state.committed_len
@@ -1181,8 +1183,8 @@ class SpecExecClient:
         base_token_index = state.committed_len
         blocked_token_id = self._get_frontier_blocked_token_id(state)
         blocked_tokens = self._compute_blocked_tokens_for_prefix(state)
-        target_distinct_first_tokens = min(3, max(1, state.window_size))
-        max_ranked_candidates_to_inspect = 8
+        target_distinct_first_tokens = min(4, max(2, state.window_size))
+        max_ranked_candidates_to_inspect = 12
         state.frontier_local_tiny_rebuild_count += 1
         state.frontier_local_tiny_rebuild_last_reason = reason
         self._log_dasd_state_event(
@@ -1208,35 +1210,50 @@ class SpecExecClient:
             with self._dasd_tree_budget_context(state):
                 self._grow_tree(prefill=True)
             self._log_dasd_leaf_candidates(state)
-            candidates, inspected = self._extract_distinct_first_token_candidates_for_dasd(
-                state,
-                blocked_tokens=blocked_tokens,
-                target_distinct_first_tokens=target_distinct_first_tokens,
-                max_ranked_candidates_to_inspect=max_ranked_candidates_to_inspect,
+            candidates, inspected, root_child_signature = (
+                self._extract_root_child_diversity_reserved_candidates_for_tiny_rebuild(
+                    state,
+                    blocked_tokens=blocked_tokens,
+                    target_root_children=target_distinct_first_tokens,
+                    max_ranked_candidates_to_inspect=max_ranked_candidates_to_inspect,
+                )
             )
         finally:
             state.tree_budget = original_tree_budget
 
         state.frontier_local_tiny_rebuild_inspected_count += inspected
-        distinct_signature = tuple(int(candidate[0]) for candidate in candidates if candidate)
         if (
             state.frontier_local_tiny_rebuild_last_committed_len == state.committed_len
             and state.frontier_local_tiny_rebuild_last_blocked_token_id == blocked_token_id
-            and state.frontier_local_tiny_rebuild_last_distinct_signature
-            == distinct_signature
+            and state.frontier_local_tiny_rebuild_root_child_last_signature
+            == root_child_signature
         ):
             state.frontier_local_tiny_rebuild_fail_count += 1
             state.frontier_local_tiny_rebuild_repeated_signature_fail_count += 1
+            state.frontier_local_tiny_rebuild_root_child_reserve_fail_count += 1
             state.frontier_local_tiny_rebuild_last_reason = (
                 "frontier_token_blocked_tiny_rebuild_no_alternative"
+            )
+            state.frontier_local_tiny_rebuild_root_child_last_reason = (
+                "repeated_root_child_signature"
+            )
+            self._log_dasd_state_event(
+                "frontier_local_tiny_rebuild_root_child_fail",
+                state,
+                decision_reason="repeated_root_child_signature",
+                base_token_index=base_token_index,
+                blocked_tokens=sorted(blocked_tokens),
+                distinct_root_children_considered=root_child_signature,
+                reserve_pool_size=len(candidates),
+                inspected_candidates=inspected,
             )
             self._log_dasd_state_event(
                 "frontier_local_tiny_rebuild_fail",
                 state,
-                decision_reason="repeated_tiny_rebuild_signature",
+                decision_reason="repeated_root_child_signature",
                 base_token_index=base_token_index,
                 blocked_tokens=sorted(blocked_tokens),
-                distinct_first_tokens_considered=distinct_signature,
+                distinct_first_tokens_considered=root_child_signature,
                 distinct_pool_size=len(candidates),
                 inspected_candidates=inspected,
             )
@@ -1244,7 +1261,8 @@ class SpecExecClient:
 
         state.frontier_local_tiny_rebuild_last_committed_len = state.committed_len
         state.frontier_local_tiny_rebuild_last_blocked_token_id = blocked_token_id
-        state.frontier_local_tiny_rebuild_last_distinct_signature = distinct_signature
+        state.frontier_local_tiny_rebuild_last_distinct_signature = root_child_signature
+        state.frontier_local_tiny_rebuild_root_child_last_signature = root_child_signature
 
         chosen_candidate = None
         choose_reason = "frontier_token_blocked_tiny_rebuild_no_alternative"
@@ -1286,8 +1304,22 @@ class SpecExecClient:
                 reason="frontier_local_tiny_rebuild_success",
             )
             state.frontier_local_tiny_rebuild_success_count += 1
+            state.frontier_local_tiny_rebuild_root_child_reserve_success_count += 1
             state.frontier_local_tiny_rebuild_last_reason = (
                 "frontier_local_tiny_rebuild_success"
+            )
+            state.frontier_local_tiny_rebuild_root_child_last_reason = (
+                "frontier_local_tiny_rebuild_success"
+            )
+            self._log_dasd_state_event(
+                "frontier_local_tiny_rebuild_root_child_success",
+                state,
+                decision_reason="frontier_local_tiny_rebuild_success",
+                base_token_index=base_token_index,
+                chosen_root_child_token=int(chosen_candidate[0]),
+                distinct_root_children_considered=root_child_signature,
+                reserve_pool_size=len(candidates),
+                inspected_candidates=inspected,
             )
             self._log_dasd_state_event(
                 "frontier_local_tiny_rebuild_success",
@@ -1295,15 +1327,28 @@ class SpecExecClient:
                 decision_reason="frontier_local_tiny_rebuild_success",
                 base_token_index=base_token_index,
                 chosen_first_token=int(chosen_candidate[0]),
-                distinct_first_tokens_considered=distinct_signature,
+                distinct_first_tokens_considered=root_child_signature,
                 distinct_pool_size=len(candidates),
                 inspected_candidates=inspected,
             )
             return True, "frontier_local_tiny_rebuild_success"
 
         state.frontier_local_tiny_rebuild_fail_count += 1
+        state.frontier_local_tiny_rebuild_root_child_reserve_fail_count += 1
         state.frontier_local_tiny_rebuild_last_reason = (
             "frontier_token_blocked_tiny_rebuild_no_alternative"
+        )
+        state.frontier_local_tiny_rebuild_root_child_last_reason = choose_reason
+        self._log_dasd_state_event(
+            "frontier_local_tiny_rebuild_root_child_fail",
+            state,
+            decision_reason="frontier_token_blocked_tiny_rebuild_no_alternative",
+            base_token_index=base_token_index,
+            blocked_tokens=sorted(blocked_tokens),
+            distinct_root_children_considered=root_child_signature,
+            reserve_pool_size=len(candidates),
+            inspected_candidates=inspected,
+            reason=choose_reason,
         )
         self._log_dasd_state_event(
             "frontier_local_tiny_rebuild_fail",
@@ -1311,12 +1356,194 @@ class SpecExecClient:
             decision_reason="frontier_token_blocked_tiny_rebuild_no_alternative",
             base_token_index=base_token_index,
             blocked_tokens=sorted(blocked_tokens),
-            distinct_first_tokens_considered=distinct_signature,
+            distinct_first_tokens_considered=root_child_signature,
             distinct_pool_size=len(candidates),
             inspected_candidates=inspected,
             reason=choose_reason,
         )
         return False, "frontier_token_blocked_tiny_rebuild_no_alternative"
+
+    def _extract_root_child_diversity_reserved_candidates_for_tiny_rebuild(
+        self,
+        state: DasdRequestState,
+        *,
+        blocked_tokens: set[int],
+        target_root_children: int,
+        max_ranked_candidates_to_inspect: int = 12,
+    ) -> tuple[list[list[int]], int, tuple[int, ...]]:
+        state.frontier_local_tiny_rebuild_root_child_reserve_count += 1
+        state.frontier_local_tiny_rebuild_root_child_last_reason = "begin"
+        self._log_dasd_state_event(
+            "frontier_local_tiny_rebuild_root_child_begin",
+            state,
+            decision_reason="frontier_local_tiny_rebuild_root_child_begin",
+            base_token_index=state.committed_len,
+            blocked_tokens=sorted(blocked_tokens),
+            target_root_children=target_root_children,
+            max_ranked_candidates_to_inspect=max_ranked_candidates_to_inspect,
+        )
+        if self._tree.end <= self._tree.prefix_len:
+            return [], 0, ()
+
+        all_indices = torch.arange(
+            self._tree.prefix_len, self._tree.end, dtype=torch.long, device=self._device
+        )
+        parent_mask = torch.zeros(self._tree.end, dtype=torch.bool, device=self._device)
+        parent_mask[self._tree.parents[self._tree.prefix_len : self._tree.end]] = True
+        leaf_indices = all_indices[~parent_mask[all_indices]]
+        if leaf_indices.numel() == 0:
+            leaf_indices = all_indices
+        if leaf_indices.numel() == 0:
+            return [], 0, ()
+
+        leaf_depths = self._tree.positions[leaf_indices]
+        leaf_scores = self._tree.logprobs[leaf_indices]
+        sort_order = sorted(
+            range(leaf_indices.numel()),
+            key=lambda idx: (
+                int(leaf_depths[idx].item()),
+                float(leaf_scores[idx].item()),
+            ),
+            reverse=True,
+        )
+
+        reserved_by_root_child: dict[int, list[int]] = {}
+        reserve_order: list[int] = []
+        seen_paths: set[tuple[int, ...]] = set()
+        inspected = 0
+        for rank_index, idx in enumerate(sort_order[:max_ranked_candidates_to_inspect]):
+            inspected += 1
+            leaf_idx = int(leaf_indices[idx].item())
+            path_indices = []
+            cursor = leaf_idx
+            while cursor >= self._tree.prefix_len:
+                path_indices.append(cursor)
+                cursor = int(self._tree.parents[cursor].item())
+            if not path_indices:
+                state.frontier_local_tiny_rebuild_candidate_reject_count += 1
+                self._log_dasd_state_event(
+                    "frontier_local_tiny_rebuild_root_child_candidate",
+                    state,
+                    decision_reason="empty_candidate",
+                    base_token_index=state.committed_len,
+                    candidate_first_token=None,
+                    root_child_token=None,
+                    candidate_len=0,
+                    rank_index=rank_index,
+                    accepted_into_reserve=False,
+                    reject_reason="empty_candidate",
+                )
+                continue
+            path_indices.reverse()
+            candidate = self._tree.tokens[
+                torch.tensor(path_indices, dtype=torch.long, device=self._device)
+            ].tolist()
+            if not candidate:
+                state.frontier_local_tiny_rebuild_candidate_reject_count += 1
+                self._log_dasd_state_event(
+                    "frontier_local_tiny_rebuild_root_child_candidate",
+                    state,
+                    decision_reason="empty_candidate",
+                    base_token_index=state.committed_len,
+                    candidate_first_token=None,
+                    root_child_token=None,
+                    candidate_len=0,
+                    rank_index=rank_index,
+                    accepted_into_reserve=False,
+                    reject_reason="empty_candidate",
+                )
+                continue
+            root_child_token = int(candidate[0])
+            path_key = tuple(candidate)
+            if path_key in seen_paths:
+                state.frontier_local_tiny_rebuild_root_child_duplicate_reject_count += 1
+                self._log_dasd_state_event(
+                    "frontier_local_tiny_rebuild_root_child_candidate",
+                    state,
+                    decision_reason="duplicate_candidate_path",
+                    base_token_index=state.committed_len,
+                    candidate_first_token=root_child_token,
+                    root_child_token=root_child_token,
+                    candidate_len=len(candidate),
+                    rank_index=rank_index,
+                    accepted_into_reserve=False,
+                    reject_reason="duplicate_candidate_path",
+                )
+                continue
+            seen_paths.add(path_key)
+            if root_child_token in blocked_tokens:
+                state.frontier_local_tiny_rebuild_root_child_blocked_reject_count += 1
+                self._log_dasd_state_event(
+                    "frontier_local_tiny_rebuild_root_child_candidate",
+                    state,
+                    decision_reason="blocked_root_child",
+                    base_token_index=state.committed_len,
+                    candidate_first_token=root_child_token,
+                    root_child_token=root_child_token,
+                    candidate_len=len(candidate),
+                    rank_index=rank_index,
+                    accepted_into_reserve=False,
+                    reject_reason="blocked_root_child",
+                )
+                continue
+            if not self._validate_dasd_token_ids(
+                state,
+                candidate,
+                source_path="frontier_local_tiny_rebuild_root_child",
+                bundle_id=state.next_bundle_id,
+                base_token_index=state.committed_len,
+            ):
+                state.frontier_local_tiny_rebuild_candidate_reject_count += 1
+                self._log_dasd_state_event(
+                    "frontier_local_tiny_rebuild_root_child_candidate",
+                    state,
+                    decision_reason="invalid_candidate",
+                    base_token_index=state.committed_len,
+                    candidate_first_token=root_child_token,
+                    root_child_token=root_child_token,
+                    candidate_len=len(candidate),
+                    rank_index=rank_index,
+                    accepted_into_reserve=False,
+                    reject_reason="invalid_candidate",
+                )
+                continue
+            if root_child_token in reserved_by_root_child:
+                state.frontier_local_tiny_rebuild_root_child_duplicate_reject_count += 1
+                self._log_dasd_state_event(
+                    "frontier_local_tiny_rebuild_root_child_candidate",
+                    state,
+                    decision_reason="duplicate_root_child",
+                    base_token_index=state.committed_len,
+                    candidate_first_token=root_child_token,
+                    root_child_token=root_child_token,
+                    candidate_len=len(candidate),
+                    rank_index=rank_index,
+                    accepted_into_reserve=False,
+                    reject_reason="duplicate_root_child",
+                )
+                continue
+            reserved_by_root_child[root_child_token] = candidate
+            reserve_order.append(root_child_token)
+            self._log_dasd_state_event(
+                "frontier_local_tiny_rebuild_root_child_reserved",
+                state,
+                decision_reason="reserved_root_child_candidate",
+                base_token_index=state.committed_len,
+                candidate_first_token=root_child_token,
+                root_child_token=root_child_token,
+                candidate_len=len(candidate),
+                rank_index=rank_index,
+                reserve_pool_size=len(reserve_order),
+            )
+            if len(reserve_order) >= target_root_children:
+                break
+
+        candidates = [reserved_by_root_child[token] for token in reserve_order]
+        state.frontier_local_tiny_rebuild_root_child_reserved_pool_size_total += len(
+            candidates
+        )
+        state.frontier_local_tiny_rebuild_root_child_inspected_count += inspected
+        return candidates, inspected, tuple(reserve_order)
 
     def _extract_ranked_path_token_candidates_for_dasd(
         self,
@@ -2550,6 +2777,15 @@ class SpecExecClient:
                 "frontier_local_tiny_rebuild_inspected_count": state.frontier_local_tiny_rebuild_inspected_count,
                 "frontier_local_tiny_rebuild_repeated_signature_fail_count": state.frontier_local_tiny_rebuild_repeated_signature_fail_count,
                 "frontier_local_tiny_rebuild_last_reason": state.frontier_local_tiny_rebuild_last_reason,
+                "frontier_local_tiny_rebuild_root_child_reserve_count": state.frontier_local_tiny_rebuild_root_child_reserve_count,
+                "frontier_local_tiny_rebuild_root_child_reserve_success_count": state.frontier_local_tiny_rebuild_root_child_reserve_success_count,
+                "frontier_local_tiny_rebuild_root_child_reserve_fail_count": state.frontier_local_tiny_rebuild_root_child_reserve_fail_count,
+                "frontier_local_tiny_rebuild_root_child_reserved_pool_size_total": state.frontier_local_tiny_rebuild_root_child_reserved_pool_size_total,
+                "frontier_local_tiny_rebuild_root_child_blocked_reject_count": state.frontier_local_tiny_rebuild_root_child_blocked_reject_count,
+                "frontier_local_tiny_rebuild_root_child_duplicate_reject_count": state.frontier_local_tiny_rebuild_root_child_duplicate_reject_count,
+                "frontier_local_tiny_rebuild_root_child_inspected_count": state.frontier_local_tiny_rebuild_root_child_inspected_count,
+                "frontier_local_tiny_rebuild_root_child_last_signature": state.frontier_local_tiny_rebuild_root_child_last_signature,
+                "frontier_local_tiny_rebuild_root_child_last_reason": state.frontier_local_tiny_rebuild_root_child_last_reason,
                 "cooldown_active": state.cooldown_active,
                 "cooldown_entry_count": state.cooldown_entry_count,
                 "cooldown_exit_count": state.cooldown_exit_count,

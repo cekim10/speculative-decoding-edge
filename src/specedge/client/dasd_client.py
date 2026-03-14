@@ -329,6 +329,15 @@ class DasdRequestState:
     frontier_local_tiny_rebuild_last_committed_len: int | None = None
     frontier_local_tiny_rebuild_last_blocked_token_id: int | None = None
     frontier_local_tiny_rebuild_last_distinct_signature: tuple[int, ...] | None = None
+    frontier_local_tiny_rebuild_root_child_reserve_count: int = 0
+    frontier_local_tiny_rebuild_root_child_reserve_success_count: int = 0
+    frontier_local_tiny_rebuild_root_child_reserve_fail_count: int = 0
+    frontier_local_tiny_rebuild_root_child_reserved_pool_size_total: int = 0
+    frontier_local_tiny_rebuild_root_child_blocked_reject_count: int = 0
+    frontier_local_tiny_rebuild_root_child_duplicate_reject_count: int = 0
+    frontier_local_tiny_rebuild_root_child_inspected_count: int = 0
+    frontier_local_tiny_rebuild_root_child_last_signature: tuple[int, ...] | None = None
+    frontier_local_tiny_rebuild_root_child_last_reason: str = ""
     cooldown_active: bool = False
     cooldown_entry_count: int = 0
     cooldown_exit_count: int = 0

@@ -926,6 +926,9 @@ class SpecExecClient:
         state.alternative_frontier_last_committed_len = None
         state.alternative_frontier_last_blocked_token_id = None
         state.alternative_frontier_last_candidate_first_tokens = None
+        state.alternative_frontier_distinct_first_token_target = 0
+        state.alternative_frontier_distinct_first_token_last_seen = None
+        state.alternative_frontier_last_distinct_reason = reason
 
     def _get_frontier_blocked_token_id(self, state: DasdRequestState):
         base_token_index = state.committed_len
@@ -984,6 +987,187 @@ class SpecExecClient:
             state, reason="alternative_frontier_installed"
         )
         state.alternative_frontier_last_reason = reason
+
+    def _extract_distinct_first_token_candidates_for_dasd(
+        self,
+        state: DasdRequestState,
+        *,
+        blocked_tokens: set[int],
+        target_distinct_first_tokens: int,
+        max_ranked_candidates_to_inspect: int = 8,
+    ) -> tuple[list[list[int]], int]:
+        if self._tree.end <= self._tree.prefix_len:
+            return [], 0
+
+        all_indices = torch.arange(
+            self._tree.prefix_len, self._tree.end, dtype=torch.long, device=self._device
+        )
+        parent_mask = torch.zeros(self._tree.end, dtype=torch.bool, device=self._device)
+        parent_mask[self._tree.parents[self._tree.prefix_len : self._tree.end]] = True
+        leaf_indices = all_indices[~parent_mask[all_indices]]
+        if leaf_indices.numel() == 0:
+            leaf_indices = all_indices
+        if leaf_indices.numel() == 0:
+            return [], 0
+
+        leaf_depths = self._tree.positions[leaf_indices]
+        leaf_scores = self._tree.logprobs[leaf_indices]
+        sort_order = sorted(
+            range(leaf_indices.numel()),
+            key=lambda idx: (
+                int(leaf_depths[idx].item()),
+                float(leaf_scores[idx].item()),
+            ),
+            reverse=True,
+        )
+
+        distinct_candidates: list[list[int]] = []
+        seen_paths: set[tuple[int, ...]] = set()
+        seen_first_tokens: set[int] = set()
+        inspected = 0
+        for rank_index, idx in enumerate(sort_order[:max_ranked_candidates_to_inspect]):
+            inspected += 1
+            leaf_idx = int(leaf_indices[idx].item())
+            path_indices = []
+            cursor = leaf_idx
+            while cursor >= self._tree.prefix_len:
+                path_indices.append(cursor)
+                cursor = int(self._tree.parents[cursor].item())
+            if not path_indices:
+                state.alternative_frontier_distinct_first_token_reject_count += 1
+                self._log_dasd_state_event(
+                    "alternative_frontier_distinct_candidate",
+                    state,
+                    decision_reason="empty_candidate",
+                    base_token_index=state.committed_len,
+                    first_token=None,
+                    candidate_len=0,
+                    rank_index=rank_index,
+                    accepted_for_distinct_pool=False,
+                    reject_reason="empty_candidate",
+                )
+                continue
+            path_indices.reverse()
+            candidate = self._tree.tokens[
+                torch.tensor(path_indices, dtype=torch.long, device=self._device)
+            ].tolist()
+            if not candidate:
+                state.alternative_frontier_distinct_first_token_reject_count += 1
+                self._log_dasd_state_event(
+                    "alternative_frontier_distinct_candidate",
+                    state,
+                    decision_reason="empty_candidate",
+                    base_token_index=state.committed_len,
+                    first_token=None,
+                    candidate_len=0,
+                    rank_index=rank_index,
+                    accepted_for_distinct_pool=False,
+                    reject_reason="empty_candidate",
+                )
+                continue
+            first_token = int(candidate[0])
+            path_key = tuple(candidate)
+            if path_key in seen_paths:
+                state.alternative_frontier_distinct_first_token_reject_count += 1
+                self._log_dasd_state_event(
+                    "alternative_frontier_distinct_candidate",
+                    state,
+                    decision_reason="duplicate_candidate_path",
+                    base_token_index=state.committed_len,
+                    first_token=first_token,
+                    candidate_len=len(candidate),
+                    rank_index=rank_index,
+                    accepted_for_distinct_pool=False,
+                    reject_reason="duplicate_candidate_path",
+                )
+                continue
+            seen_paths.add(path_key)
+            if first_token in blocked_tokens:
+                state.alternative_frontier_distinct_first_token_reject_count += 1
+                state.alternative_frontier_distinct_first_token_blocked_reject_count += 1
+                self._log_dasd_state_event(
+                    "alternative_frontier_distinct_candidate",
+                    state,
+                    decision_reason="blocked_first_token",
+                    base_token_index=state.committed_len,
+                    first_token=first_token,
+                    candidate_len=len(candidate),
+                    rank_index=rank_index,
+                    accepted_for_distinct_pool=False,
+                    reject_reason="blocked_first_token",
+                )
+                continue
+            if not self._validate_dasd_token_ids(
+                state,
+                candidate,
+                source_path="alternative_frontier_distinct_candidate",
+                bundle_id=state.next_bundle_id,
+                base_token_index=state.committed_len,
+            ):
+                state.alternative_frontier_distinct_first_token_reject_count += 1
+                self._log_dasd_state_event(
+                    "alternative_frontier_distinct_candidate",
+                    state,
+                    decision_reason="invalid_candidate",
+                    base_token_index=state.committed_len,
+                    first_token=first_token,
+                    candidate_len=len(candidate),
+                    rank_index=rank_index,
+                    accepted_for_distinct_pool=False,
+                    reject_reason="invalid_candidate",
+                )
+                continue
+            if first_token in seen_first_tokens:
+                state.alternative_frontier_distinct_first_token_reject_count += 1
+                self._log_dasd_state_event(
+                    "alternative_frontier_distinct_candidate",
+                    state,
+                    decision_reason="duplicate_first_token",
+                    base_token_index=state.committed_len,
+                    first_token=first_token,
+                    candidate_len=len(candidate),
+                    rank_index=rank_index,
+                    accepted_for_distinct_pool=False,
+                    reject_reason="duplicate_first_token",
+                )
+                continue
+            seen_first_tokens.add(first_token)
+            distinct_candidates.append(candidate)
+            self._log_dasd_state_event(
+                "alternative_frontier_distinct_candidate",
+                state,
+                decision_reason="accepted_for_distinct_pool",
+                base_token_index=state.committed_len,
+                first_token=first_token,
+                candidate_len=len(candidate),
+                rank_index=rank_index,
+                accepted_for_distinct_pool=True,
+            )
+            if len(distinct_candidates) >= target_distinct_first_tokens:
+                break
+
+        return distinct_candidates, inspected
+
+    def _choose_sendable_alternative_frontier_candidate(
+        self,
+        state: DasdRequestState,
+        candidates: list[list[int]],
+    ) -> tuple[list[int] | None, str]:
+        base_token_index = state.committed_len
+        for candidate in candidates:
+            sendable, reason = self._is_candidate_first_token_sendable(
+                state,
+                base_token_index,
+                candidate,
+            )
+            if sendable:
+                return candidate, "sendable"
+            state.alternative_frontier_candidate_reject_count += 1
+            state.alternative_frontier_distinct_first_token_reject_count += 1
+            if reason == "candidate_first_token_blocked":
+                state.alternative_frontier_blocked_first_token_count += 1
+                state.alternative_frontier_distinct_first_token_blocked_reject_count += 1
+        return None, "frontier_token_blocked_no_alternative"
 
     def _extract_ranked_path_token_candidates_for_dasd(
         self,
@@ -1055,118 +1239,126 @@ class SpecExecClient:
     ):
         base_token_index = state.committed_len
         blocked_token_id = self._get_frontier_blocked_token_id(state)
+        blocked_tokens = self._compute_blocked_tokens_for_prefix(state)
+        target_distinct_first_tokens = min(3, max(1, state.window_size))
+        max_ranked_candidates_to_inspect = max(8, max_candidate_tries * 2)
         state.alternative_frontier_search_count += 1
+        state.alternative_frontier_distinct_first_token_search_count += 1
         state.alternative_frontier_last_reason = reason
+        state.alternative_frontier_distinct_first_token_target = (
+            target_distinct_first_tokens
+        )
         self._log_dasd_state_event(
-            "alternative_frontier_search_begin",
+            "alternative_frontier_distinct_search_begin",
             state,
             decision_reason=reason,
             base_token_index=base_token_index,
+            blocked_tokens=sorted(blocked_tokens),
             blocked_token=blocked_token_id,
-            max_candidate_tries=max_candidate_tries,
+            target_distinct_first_tokens=target_distinct_first_tokens,
+            max_ranked_candidates_to_inspect=max_ranked_candidates_to_inspect,
         )
+        if self._tree.end <= self._tree.prefix_len:
+            state.alternative_frontier_search_fail_count += 1
+            state.alternative_frontier_distinct_first_token_fail_count += 1
+            state.alternative_frontier_last_reason = "frontier_token_blocked_no_alternative"
+            state.alternative_frontier_last_distinct_reason = "tree_empty"
+            self._log_dasd_state_event(
+                "alternative_frontier_distinct_search_fail",
+                state,
+                decision_reason="tree_empty",
+                base_token_index=base_token_index,
+                blocked_tokens=sorted(blocked_tokens),
+                distinct_first_tokens_considered=(),
+                distinct_pool_size=0,
+                inspected_candidates=0,
+            )
+            return False, "frontier_token_blocked_no_alternative"
 
-        state.alternative_frontier_rebuild_count += 1
-        self._reset_tree_from_dasd_state(state, use_full_drafted=False)
-        with self._dasd_tree_budget_context(state):
-            self._grow_tree(prefill=True)
-        self._log_dasd_leaf_candidates(state)
-
-        candidates = self._extract_ranked_path_token_candidates_for_dasd(
+        candidates, inspected = self._extract_distinct_first_token_candidates_for_dasd(
             state,
-            max_candidates=max_candidate_tries,
+            blocked_tokens=blocked_tokens,
+            target_distinct_first_tokens=target_distinct_first_tokens,
+            max_ranked_candidates_to_inspect=max_ranked_candidates_to_inspect,
         )
+        state.alternative_frontier_distinct_first_token_inspected_count += inspected
         candidate_first_tokens = tuple(
             int(candidate[0]) for candidate in candidates if candidate
         )
         if (
             state.alternative_frontier_last_committed_len == state.committed_len
             and state.alternative_frontier_last_blocked_token_id == blocked_token_id
-            and state.alternative_frontier_last_candidate_first_tokens
+            and state.alternative_frontier_distinct_first_token_last_seen
             == candidate_first_tokens
         ):
             state.alternative_frontier_search_fail_count += 1
+            state.alternative_frontier_distinct_first_token_fail_count += 1
             state.alternative_frontier_last_reason = (
                 "frontier_token_blocked_no_alternative"
             )
+            state.alternative_frontier_last_distinct_reason = (
+                "repeated_distinct_first_token_signature"
+            )
             self._log_dasd_state_event(
-                "alternative_frontier_search_fail",
+                "alternative_frontier_distinct_search_fail",
                 state,
-                decision_reason="repeated_candidate_signature",
+                decision_reason="repeated_distinct_first_token_signature",
                 base_token_index=base_token_index,
-                blocked_token=blocked_token_id,
-                candidate_first_tokens=candidate_first_tokens,
+                blocked_tokens=sorted(blocked_tokens),
+                distinct_first_tokens_considered=candidate_first_tokens,
+                distinct_pool_size=len(candidates),
+                inspected_candidates=inspected,
             )
             return False, "frontier_token_blocked_no_alternative"
 
         state.alternative_frontier_last_committed_len = state.committed_len
         state.alternative_frontier_last_blocked_token_id = blocked_token_id
         state.alternative_frontier_last_candidate_first_tokens = candidate_first_tokens
+        state.alternative_frontier_distinct_first_token_last_seen = (
+            candidate_first_tokens
+        )
 
-        for attempt, candidate in enumerate(candidates[:max_candidate_tries], start=1):
-            candidate_len = min(len(candidate), state.window_size)
-            candidate_prefix = candidate[:candidate_len]
-            sendable, candidate_reason = self._is_candidate_first_token_sendable(
+        chosen_candidate, choose_reason = (
+            self._choose_sendable_alternative_frontier_candidate(state, candidates)
+        )
+        if chosen_candidate is not None:
+            self._install_alternative_frontier_suffix(
                 state,
-                base_token_index,
-                candidate_prefix,
+                chosen_candidate,
+                reason="alternative_frontier_found",
+            )
+            state.alternative_frontier_search_success_count += 1
+            state.alternative_frontier_distinct_first_token_success_count += 1
+            state.alternative_frontier_last_reason = "alternative_frontier_found"
+            state.alternative_frontier_last_distinct_reason = (
+                "alternative_frontier_found"
             )
             self._log_dasd_state_event(
-                "alternative_frontier_candidate",
+                "alternative_frontier_distinct_search_success",
                 state,
-                decision_reason=candidate_reason,
+                decision_reason="alternative_frontier_found",
                 base_token_index=base_token_index,
-                blocked_token=blocked_token_id,
-                candidate_first_token=(
-                    int(candidate_prefix[0]) if candidate_prefix else None
-                ),
-                candidate_len=candidate_len,
-                attempt=attempt,
+                chosen_first_token=int(chosen_candidate[0]),
+                distinct_first_tokens_considered=candidate_first_tokens,
+                distinct_pool_size=len(candidates),
+                inspected_candidates=inspected,
             )
-            if sendable:
-                self._install_alternative_frontier_suffix(
-                    state,
-                    candidate,
-                    reason="alternative_frontier_found",
-                )
-                state.alternative_frontier_search_success_count += 1
-                state.alternative_frontier_last_reason = "alternative_frontier_found"
-                self._log_dasd_state_event(
-                    "alternative_frontier_search_success",
-                    state,
-                    decision_reason="alternative_frontier_found",
-                    base_token_index=base_token_index,
-                    blocked_token=blocked_token_id,
-                    candidate_first_token=int(candidate_prefix[0]),
-                    candidate_len=len(candidate),
-                    attempt=attempt,
-                )
-                return True, "alternative_frontier_found"
-            state.alternative_frontier_candidate_reject_count += 1
-            if candidate_reason == "candidate_first_token_blocked":
-                state.alternative_frontier_blocked_first_token_count += 1
-            self._log_dasd_state_event(
-                "alternative_frontier_candidate_rejected",
-                state,
-                decision_reason=candidate_reason,
-                base_token_index=base_token_index,
-                blocked_token=blocked_token_id,
-                candidate_first_token=(
-                    int(candidate_prefix[0]) if candidate_prefix else None
-                ),
-                candidate_len=candidate_len,
-                attempt=attempt,
-            )
+            return True, "alternative_frontier_found"
 
         state.alternative_frontier_search_fail_count += 1
+        state.alternative_frontier_distinct_first_token_fail_count += 1
         state.alternative_frontier_last_reason = "frontier_token_blocked_no_alternative"
+        state.alternative_frontier_last_distinct_reason = choose_reason
         self._log_dasd_state_event(
-            "alternative_frontier_search_fail",
+            "alternative_frontier_distinct_search_fail",
             state,
             decision_reason="frontier_token_blocked_no_alternative",
             base_token_index=base_token_index,
-            blocked_token=blocked_token_id,
-            candidate_first_tokens=candidate_first_tokens,
+            blocked_tokens=sorted(blocked_tokens),
+            distinct_first_tokens_considered=candidate_first_tokens,
+            distinct_pool_size=len(candidates),
+            inspected_candidates=inspected,
+            reason=choose_reason,
         )
         return False, "frontier_token_blocked_no_alternative"
 
@@ -2167,6 +2359,13 @@ class SpecExecClient:
                 "alternative_frontier_blocked_first_token_count": state.alternative_frontier_blocked_first_token_count,
                 "alternative_frontier_rebuild_count": state.alternative_frontier_rebuild_count,
                 "alternative_frontier_last_reason": state.alternative_frontier_last_reason,
+                "alternative_frontier_distinct_first_token_search_count": state.alternative_frontier_distinct_first_token_search_count,
+                "alternative_frontier_distinct_first_token_success_count": state.alternative_frontier_distinct_first_token_success_count,
+                "alternative_frontier_distinct_first_token_fail_count": state.alternative_frontier_distinct_first_token_fail_count,
+                "alternative_frontier_distinct_first_token_reject_count": state.alternative_frontier_distinct_first_token_reject_count,
+                "alternative_frontier_distinct_first_token_blocked_reject_count": state.alternative_frontier_distinct_first_token_blocked_reject_count,
+                "alternative_frontier_distinct_first_token_inspected_count": state.alternative_frontier_distinct_first_token_inspected_count,
+                "alternative_frontier_last_distinct_reason": state.alternative_frontier_last_distinct_reason,
                 "cooldown_active": state.cooldown_active,
                 "cooldown_entry_count": state.cooldown_entry_count,
                 "cooldown_exit_count": state.cooldown_exit_count,

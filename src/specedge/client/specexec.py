@@ -839,7 +839,11 @@ class SpecExecClient:
                 max(state.window_size, missing_tokens),
             )
             before_len = len(state.drafted_tokens)
-            self._draft_more_for_dasd(state, target_tokens)
+            self._draft_more_for_dasd(
+                state,
+                target_tokens,
+                preserve_speculative_suffix_only=(phase == "suffix_refresh"),
+            )
             after_len = len(state.drafted_tokens)
             if after_len >= min_required_end:
                 state.draft_regeneration_success_count += 1
@@ -3305,7 +3309,12 @@ class SpecExecClient:
         state.finish_status = "explicit_abort_reason"
         await self._drain_dasd_inflight(state)
 
-    def _draft_more_for_dasd(self, state: DasdRequestState, target_tokens: int):
+    def _draft_more_for_dasd(
+        self,
+        state: DasdRequestState,
+        target_tokens: int,
+        preserve_speculative_suffix_only: bool = False,
+    ):
         if target_tokens <= 0:
             return
 
@@ -3313,24 +3322,31 @@ class SpecExecClient:
         appended = 0
         while appended < target_tokens and max_attempt > 0:
             max_attempt -= 1
-            use_full_drafted = len(state.drafted_tokens) > state.committed_len
+            before_total_len = len(state.drafted_tokens)
+            existing_suffix = state.drafted_tokens[state.committed_len :]
+            if preserve_speculative_suffix_only:
+                use_full_drafted = False
+            else:
+                use_full_drafted = len(state.drafted_tokens) > state.committed_len
             if config.dasd_debug:
                 committed_prefix_tail = state.drafted_tokens[
                     max(0, state.committed_len - 8) : state.committed_len
                 ]
-                drafted_suffix = state.drafted_tokens[state.committed_len :]
                 self._logger.info(
-                    "[DASD] regrow_start req=%s epoch=%d committed=%d credit=%s W=%d tree_budget=%s prefix_tail=%s drafted_suffix=%s use_full_drafted=%s",
+                    "[DASD] regrow_mode req=%s epoch=%d committed=%d drafted_len=%d target_tokens=%d credit=%s W=%d tree_budget=%s prefix_tail=%s drafted_suffix=%s preserve_speculative_suffix_only=%s use_full_drafted=%s",
                     state.request_id,
                     state.epoch,
                     state.committed_len,
+                    len(state.drafted_tokens),
+                    target_tokens,
                     state.credit_controller.credit
                     if state.credit_controller is not None
                     else None,
                     state.window_size,
                     state.tree_budget,
                     committed_prefix_tail,
-                    drafted_suffix,
+                    existing_suffix,
+                    preserve_speculative_suffix_only,
                     use_full_drafted,
                 )
             self._reset_tree_from_dasd_state(
@@ -3354,9 +3370,76 @@ class SpecExecClient:
             if path_tokens.numel() == 0:
                 break
 
-            append_len = min(int(path_tokens.numel()), target_tokens - appended)
-            state.drafted_tokens.extend(path_tokens[:append_len].tolist())
-            appended += append_len
+            candidate = path_tokens.tolist()
+            candidate_len_before_trim = len(candidate)
+            common = 0
+            if preserve_speculative_suffix_only:
+                max_common = min(len(existing_suffix), len(candidate))
+                while common < max_common and existing_suffix[common] == candidate[common]:
+                    common += 1
+                candidate = candidate[common:]
+                if config.dasd_debug:
+                    self._logger.info(
+                        "[DASD] regrow_overlap_trim req=%s epoch=%d committed=%d drafted_len=%d existing_suffix_len=%d candidate_len_before_trim=%d candidate_len_after_trim=%d common_prefix=%d novel_candidate=%s preserve_speculative_suffix_only=%s",
+                        state.request_id,
+                        state.epoch,
+                        state.committed_len,
+                        len(state.drafted_tokens),
+                        len(existing_suffix),
+                        candidate_len_before_trim,
+                        len(candidate),
+                        common,
+                        candidate,
+                        preserve_speculative_suffix_only,
+                    )
+
+            if not candidate:
+                if config.dasd_debug:
+                    self._logger.info(
+                        "[DASD] regrow_no_novel_suffix req=%s epoch=%d committed=%d drafted_len=%d target_tokens=%d existing_suffix_len=%d candidate_len_before_trim=%d candidate_len_after_trim=%d preserve_speculative_suffix_only=%s reason=no_novel_suffix",
+                        state.request_id,
+                        state.epoch,
+                        state.committed_len,
+                        len(state.drafted_tokens),
+                        target_tokens,
+                        len(existing_suffix),
+                        candidate_len_before_trim,
+                        len(candidate),
+                        preserve_speculative_suffix_only,
+                    )
+                break
+
+            append_chunk = candidate[: max(0, target_tokens - appended)]
+            if not append_chunk:
+                break
+
+            state.drafted_tokens.extend(append_chunk)
+            appended += len(append_chunk)
+            if config.dasd_debug:
+                self._logger.info(
+                    "[DASD] regrow_append req=%s epoch=%d committed=%d appended_tokens=%s new_drafted_len=%d preserve_speculative_suffix_only=%s",
+                    state.request_id,
+                    state.epoch,
+                    state.committed_len,
+                    append_chunk,
+                    len(state.drafted_tokens),
+                    preserve_speculative_suffix_only,
+                )
+            if preserve_speculative_suffix_only and len(state.drafted_tokens) == before_total_len:
+                if config.dasd_debug:
+                    self._logger.info(
+                        "[DASD] regrow_no_novel_suffix req=%s epoch=%d committed=%d drafted_len=%d target_tokens=%d existing_suffix_len=%d candidate_len_before_trim=%d candidate_len_after_trim=%d preserve_speculative_suffix_only=%s reason=no_append_progress",
+                        state.request_id,
+                        state.epoch,
+                        state.committed_len,
+                        len(state.drafted_tokens),
+                        target_tokens,
+                        len(existing_suffix),
+                        candidate_len_before_trim,
+                        len(candidate),
+                        preserve_speculative_suffix_only,
+                    )
+                break
 
     def _extract_best_path_tokens(self, state: Optional[DasdRequestState] = None):
         if self._tree.end <= self._tree.prefix_len:

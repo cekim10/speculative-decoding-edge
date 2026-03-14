@@ -259,7 +259,7 @@ class SpecExecClient:
             state.consecutive_full_rejections,
             state.same_base_retry_count,
             config.dasd_failure_cache_enabled,
-            sorted(self._blocked_tokens_for_prefix(state)),
+            sorted(self._compute_blocked_tokens_for_prefix(state)),
             state.aborted,
             state.finish_status,
             self._max_new_tokens,
@@ -298,7 +298,9 @@ class SpecExecClient:
             extra.pop("forced_commit_applied", None),
             extra.pop("verifier_next_token_id", None),
             extra.pop("reject_reason", None),
-            sorted(self._blocked_tokens_for_prefix(state)),
+            # Blocked-token lookup used by DASD structured logging must stay
+            # non-logging, otherwise the logger recursively re-enters itself.
+            sorted(self._compute_blocked_tokens_for_prefix(state)),
             decision_reason,
             " ".join(f"{key}={value}" for key, value in extra.items()),
         )
@@ -1817,18 +1819,21 @@ class SpecExecClient:
         for prefix_key in expired_prefix_keys:
             state.failure_cache.pop(prefix_key, None)
 
-    def _blocked_tokens_for_prefix(self, state: DasdRequestState):
+    def _compute_blocked_tokens_for_prefix(self, state: DasdRequestState):
         if not config.dasd_failure_cache_enabled:
             return set()
 
         self._purge_expired_failure_cache(state)
         prefix_key = self._dasd_prefix_key(state)
         token_entries = state.failure_cache.get(prefix_key, {})
-        blocked_tokens = {
+        return {
             token_id
             for token_id, entry in token_entries.items()
             if entry.blocked_until_round > state.verify_rounds
         }
+
+    def _blocked_tokens_for_prefix(self, state: DasdRequestState):
+        blocked_tokens = self._compute_blocked_tokens_for_prefix(state)
         if blocked_tokens:
             state.failure_cache_hits += 1
             state.failure_cache_block_decision_count += 1

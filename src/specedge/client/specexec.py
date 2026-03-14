@@ -392,6 +392,18 @@ class SpecExecClient:
         )
 
     def _current_dasd_inflight_cap(self, state: DasdRequestState):
+        if state.frontier_sync_active:
+            state.frontier_sync_inflight_cap_hits += 1
+            self._log_dasd_state_event(
+                "frontier_sync_inflight_cap_applied",
+                state,
+                decision_reason=state.last_frontier_sync_reason or "frontier_sync_active",
+                base_token_index=state.committed_len,
+                target_committed_len=state.frontier_sync_target_committed_len,
+                remaining_progress=state.frontier_sync_progress_remaining,
+                inflight_cap=1,
+            )
+            return 1
         if self._is_dasd_unstable(state):
             state.unstable_phase_inflight_cap_hits += 1
             self._log_dasd_state_event(
@@ -493,6 +505,103 @@ class SpecExecClient:
                 decision_reason=reason,
                 base_token_index=state.committed_len,
             )
+
+    def _enter_frontier_sync(self, state: DasdRequestState, reason: str):
+        if state.frontier_sync_active:
+            state.frontier_sync_target_committed_len = state.committed_len
+            state.frontier_sync_progress_remaining = max(
+                state.frontier_sync_progress_remaining,
+                2,
+            )
+            state.last_frontier_sync_reason = reason
+            self._refresh_dasd_control_targets(
+                state,
+                reason="frontier_sync_refresh",
+                next_credit=state.window_size,
+            )
+            self._log_dasd_state_event(
+                "frontier_sync_enter",
+                state,
+                decision_reason=reason,
+                base_token_index=state.committed_len,
+                target_committed_len=state.frontier_sync_target_committed_len,
+                remaining_progress=state.frontier_sync_progress_remaining,
+            )
+            return
+        state.frontier_sync_active = True
+        state.frontier_sync_target_committed_len = state.committed_len
+        state.frontier_sync_progress_remaining = 2
+        state.frontier_sync_entry_count += 1
+        state.last_frontier_sync_reason = reason
+        self._refresh_dasd_control_targets(
+            state,
+            reason="frontier_sync_enter",
+            next_credit=state.window_size,
+        )
+        self._log_dasd_state_event(
+            "frontier_sync_enter",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            target_committed_len=state.frontier_sync_target_committed_len,
+            remaining_progress=state.frontier_sync_progress_remaining,
+        )
+
+    def _record_frontier_sync_progress(self, state: DasdRequestState, reason: str):
+        if not state.frontier_sync_active:
+            return
+        target = state.frontier_sync_target_committed_len
+        if target is None or state.committed_len <= target:
+            return
+        state.frontier_sync_progress_remaining = max(
+            0, state.frontier_sync_progress_remaining - 1
+        )
+        state.frontier_sync_target_committed_len = state.committed_len
+        self._log_dasd_state_event(
+            "frontier_sync_progress",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            target_committed_len=state.frontier_sync_target_committed_len,
+            remaining_progress=state.frontier_sync_progress_remaining,
+        )
+        if state.frontier_sync_progress_remaining == 0:
+            self._exit_frontier_sync(state, reason=reason, success=True)
+
+    def _exit_frontier_sync(self, state: DasdRequestState, reason: str, success: bool):
+        if not state.frontier_sync_active:
+            return
+        state.frontier_sync_active = False
+        state.frontier_sync_target_committed_len = None
+        state.frontier_sync_progress_remaining = 0
+        state.frontier_sync_exit_count += 1
+        if success:
+            state.frontier_sync_success_count += 1
+        else:
+            state.frontier_sync_fail_count += 1
+        state.last_frontier_sync_reason = reason
+        self._refresh_dasd_control_targets(
+            state,
+            reason="frontier_sync_exit",
+            next_credit=state.window_size,
+        )
+        self._log_dasd_state_event(
+            "frontier_sync_exit",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            target_committed_len=state.frontier_sync_target_committed_len,
+            remaining_progress=state.frontier_sync_progress_remaining,
+            success=success,
+        )
+
+    def _is_frontier_sync_send_allowed(
+        self, state: DasdRequestState, base_token_index: int
+    ):
+        return (
+            not state.frontier_sync_active
+            or base_token_index == state.committed_len
+        )
 
     def _record_retry_fingerprint(
         self,
@@ -801,6 +910,7 @@ class SpecExecClient:
             state.suffix_refresh_success_count += 1
             state.rollback_cleanup_avoided_count += 1
             state.cheap_recovery_success_count += 1
+            self._enter_frontier_sync(state, reason="suffix_refresh_success")
             self._log_dasd_state_event(
                 "suffix_refresh_end",
                 state,
@@ -905,6 +1015,8 @@ class SpecExecClient:
                 reason=reason,
                 attempt=attempt_idx,
             )
+            if state.frontier_sync_active:
+                state.next_base_index = state.committed_len
             self._prepare_dasd_refill_from_committed(state, reason=reason)
             regenerated, regeneration_reason = self._regenerate_dasd_suffix(
                 state,
@@ -941,6 +1053,16 @@ class SpecExecClient:
             if state.inflight:
                 state.refill_success_count += 1
                 state.recovery_resume_success_count += 1
+                self._enter_frontier_sync(state, reason="rebuild_recovery_success")
+                state.frontier_sync_resume_count += 1
+                self._log_dasd_state_event(
+                    "frontier_sync_resume",
+                    state,
+                    decision_reason="rebuild_recovery_success",
+                    base_token_index=state.committed_len,
+                    target_committed_len=state.frontier_sync_target_committed_len,
+                    remaining_progress=state.frontier_sync_progress_remaining,
+                )
                 self._exit_local_stabilization(state, reason="rebuild_recovery_success", success=True)
                 self._enter_cooldown(state, reason="rebuild_recovery_success")
                 if config.dasd_debug:
@@ -1300,6 +1422,11 @@ class SpecExecClient:
             finish_status = "refill_not_possible"
         state.finish_status = finish_status
         self._log_finish_condition(state, reason=finish_status)
+        self._exit_frontier_sync(
+            state,
+            reason=finish_status,
+            success=finish_status in {"eos_reached", "max_new_tokens_reached"},
+        )
 
         await self._drain_dasd_inflight(state)
         self._maybe_emit_base_lifecycle_summary(
@@ -1411,6 +1538,14 @@ class SpecExecClient:
                 "rollback_cleanup_deferred_count": state.rollback_cleanup_deferred_count,
                 "rollback_cleanup_escalated_count": state.rollback_cleanup_escalated_count,
                 "rollback_cleanup_avoided_count": state.rollback_cleanup_avoided_count,
+                "frontier_sync_active": state.frontier_sync_active,
+                "frontier_sync_entry_count": state.frontier_sync_entry_count,
+                "frontier_sync_exit_count": state.frontier_sync_exit_count,
+                "frontier_sync_success_count": state.frontier_sync_success_count,
+                "frontier_sync_fail_count": state.frontier_sync_fail_count,
+                "frontier_sync_send_gate_block_count": state.frontier_sync_send_gate_block_count,
+                "frontier_sync_inflight_cap_hits": state.frontier_sync_inflight_cap_hits,
+                "frontier_sync_resume_count": state.frontier_sync_resume_count,
                 "cooldown_active": state.cooldown_active,
                 "cooldown_entry_count": state.cooldown_entry_count,
                 "cooldown_exit_count": state.cooldown_exit_count,
@@ -1428,6 +1563,7 @@ class SpecExecClient:
                 "last_suffix_refresh_reason": state.last_suffix_refresh_reason,
                 "last_cooldown_reason": state.last_cooldown_reason,
                 "last_retry_quality_reason": state.last_retry_quality_reason,
+                "last_frontier_sync_reason": state.last_frontier_sync_reason,
                 "average_W": (
                     state.sum_window_at_send / state.verify_rounds
                     if state.verify_rounds > 0
@@ -1516,6 +1652,19 @@ class SpecExecClient:
             fallback_max_n_beams=self._fixed_max_n_beams,
             fallback_max_branch_width=self._fixed_max_branch_width,
         )
+
+        if state.frontier_sync_active:
+            conservative_budget = self._conservative_dasd_tree_budget()
+            state.window_size = max(1, min(state.window_size, config.dasd_recovery_forced_w))
+            state.tree_budget = conservative_budget
+            self._log_dasd_state_event(
+                "mitigation_decision",
+                state,
+                decision_reason="frontier_sync_active",
+                base_token_index=state.committed_len,
+                target_committed_len=state.frontier_sync_target_committed_len,
+                remaining_progress=state.frontier_sync_progress_remaining,
+            )
 
         if state.local_stabilization_active or state.cooldown_active:
             conservative_budget = self._conservative_dasd_tree_budget()
@@ -1989,6 +2138,7 @@ class SpecExecClient:
         state.failure_cache.pop(old_prefix_key, None)
         state.base_retry_counts.pop(base_token_index, None)
         self._reset_tree_from_dasd_state(state, use_full_drafted=False)
+        self._enter_frontier_sync(state, reason="fallback_burst_progress")
         blocked_tokens = sorted(self._blocked_tokens_for_prefix(state))
         if config.dasd_debug:
             prefix_tail = state.drafted_tokens[max(0, state.committed_len - 8) : state.committed_len]
@@ -2170,6 +2320,7 @@ class SpecExecClient:
             sync_base=base_token_index,
             sync_token_id=token_id,
         )
+        self._enter_frontier_sync(state, reason="forced_commit_progress")
         self._exit_local_stabilization(
             state,
             reason="forced_commit_progress",
@@ -2252,7 +2403,24 @@ class SpecExecClient:
             inflight_cap = self._current_dasd_inflight_cap(state)
             if len(state.inflight) >= inflight_cap:
                 break
-            required_end = state.next_base_index + state.window_size
+            if state.frontier_sync_active and state.next_base_index != state.committed_len:
+                before_next_base = state.next_base_index
+                state.next_base_index = state.committed_len
+                self._log_dasd_state_event(
+                    "frontier_sync_resume",
+                    state,
+                    decision_reason="clamp_next_base_to_committed",
+                    base_token_index=state.committed_len,
+                    target_committed_len=state.frontier_sync_target_committed_len,
+                    remaining_progress=state.frontier_sync_progress_remaining,
+                    before_next_base=before_next_base,
+                    after_next_base=state.next_base_index,
+                )
+            required_end = (
+                state.committed_len + state.window_size
+                if state.frontier_sync_active
+                else state.next_base_index + state.window_size
+            )
             if required_end > len(state.drafted_tokens):
                 if allow_regeneration:
                     regenerated, regeneration_reason = self._regenerate_dasd_suffix(
@@ -2296,6 +2464,21 @@ class SpecExecClient:
                     reason="send_spawned",
                     send_spawn_count=send_spawn_count,
                 )
+                if (
+                    state.frontier_sync_active
+                    and state.cleanup_reason == "rollback_cleanup"
+                ):
+                    state.frontier_sync_resume_count += 1
+                    self._log_dasd_state_event(
+                        "frontier_sync_resume",
+                        state,
+                        decision_reason="rollback_cleanup_resume",
+                        base_token_index=state.committed_len,
+                        target_committed_len=state.frontier_sync_target_committed_len,
+                        remaining_progress=state.frontier_sync_progress_remaining,
+                    )
+                if state.frontier_sync_active:
+                    break
             elif send_reason == "low_value_retry_suppressed":
                 state.rollback_cleanup_deferred_count += 1
                 state.last_mitigation_decision_reason = send_reason
@@ -2350,6 +2533,18 @@ class SpecExecClient:
             return False, "request_inactive"
         bundle_id = state.next_bundle_id
         base_token_index = state.next_base_index
+        if not self._is_frontier_sync_send_allowed(state, base_token_index):
+            state.frontier_sync_send_gate_block_count += 1
+            state.last_retry_decision_reason = "frontier_sync_wait_for_committed_base"
+            self._log_dasd_state_event(
+                "frontier_sync_send_blocked",
+                state,
+                decision_reason=state.last_retry_decision_reason,
+                base_token_index=base_token_index,
+                target_committed_len=state.frontier_sync_target_committed_len,
+                remaining_progress=state.frontier_sync_progress_remaining,
+            )
+            return False, "frontier_sync_wait_for_committed_base"
         lifecycle = self._ensure_base_lifecycle(state, base_token_index)
         if state.current_base_tracking is None:
             state.current_base_tracking = base_token_index
@@ -2484,6 +2679,17 @@ class SpecExecClient:
         state.next_bundle_id += 1
         state.next_base_index += state.window_size
         state.cleanup_induced_drain = False
+        if state.cleanup_reason == "rollback_cleanup" and not state.frontier_sync_active:
+            self._enter_frontier_sync(state, reason="rollback_cleanup_resume")
+            state.frontier_sync_resume_count += 1
+            self._log_dasd_state_event(
+                "frontier_sync_resume",
+                state,
+                decision_reason="rollback_cleanup_resume",
+                base_token_index=base_token_index,
+                target_committed_len=state.frontier_sync_target_committed_len,
+                remaining_progress=state.frontier_sync_progress_remaining,
+            )
         if state.local_stabilization_active:
             self._log_dasd_state_event(
                 "local_stabilization_retry",
@@ -2556,6 +2762,18 @@ class SpecExecClient:
             try:
                 response = task.result()
                 state.consecutive_rpc_failures = 0
+                if (
+                    state.frontier_sync_active
+                    and task_info.base_token_index > state.committed_len
+                ):
+                    self._logger.warning(
+                        "[DASD] frontier_sync_violation req=%s epoch=%d committed=%d task_base=%d bundle=%d",
+                        state.request_id,
+                        state.epoch,
+                        state.committed_len,
+                        task_info.base_token_index,
+                        task_info.bundle_id,
+                    )
                 if (
                     task_info.request_id != state.request_id
                     or task_info.epoch_at_send != state.epoch
@@ -2713,6 +2931,10 @@ class SpecExecClient:
             state.committed_len += accepted_len
             if accepted_len > 0:
                 self._clear_suffix_refresh_anchor(state)
+                self._record_frontier_sync_progress(
+                    state,
+                    reason="committed_progress",
+                )
             assert state.committed_len >= prev_committed
             lifecycle = self._ensure_base_lifecycle(state, prev_committed)
             lifecycle["accepted_tokens_accumulated"] += accepted_len
@@ -3069,6 +3291,7 @@ class SpecExecClient:
             return
         state.aborted = True
         self._clear_suffix_refresh_anchor(state)
+        self._exit_frontier_sync(state, reason=reason, success=False)
         if state.abort_reason == "":
             state.abort_reason = reason
         self._logger.warning(

@@ -271,6 +271,16 @@ class DasdRequestState:
     rollback_cleanup_deferred_count: int = 0
     rollback_cleanup_escalated_count: int = 0
     rollback_cleanup_avoided_count: int = 0
+    frontier_sync_active: bool = False
+    frontier_sync_target_committed_len: int | None = None
+    frontier_sync_progress_remaining: int = 0
+    frontier_sync_entry_count: int = 0
+    frontier_sync_exit_count: int = 0
+    frontier_sync_success_count: int = 0
+    frontier_sync_fail_count: int = 0
+    frontier_sync_send_gate_block_count: int = 0
+    frontier_sync_inflight_cap_hits: int = 0
+    frontier_sync_resume_count: int = 0
     cooldown_active: bool = False
     cooldown_entry_count: int = 0
     cooldown_exit_count: int = 0
@@ -296,6 +306,7 @@ class DasdRequestState:
     last_suffix_refresh_reason: str = ""
     last_cooldown_reason: str = ""
     last_retry_quality_reason: str = ""
+    last_frontier_sync_reason: str = ""
     suffix_refresh_anchor_committed_len: int | None = None
     cleanup_reason: str = ""
     cleanup_induced_drain: bool = False

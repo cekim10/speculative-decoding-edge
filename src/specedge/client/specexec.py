@@ -919,6 +919,257 @@ class SpecExecClient:
     ) -> bool:
         return state.suppressed_retry_loop_count >= 2
 
+    def _reset_alternative_frontier_search_state(
+        self, state: DasdRequestState, reason: str
+    ):
+        state.alternative_frontier_last_reason = reason
+        state.alternative_frontier_last_committed_len = None
+        state.alternative_frontier_last_blocked_token_id = None
+        state.alternative_frontier_last_candidate_first_tokens = None
+
+    def _get_frontier_blocked_token_id(self, state: DasdRequestState):
+        base_token_index = state.committed_len
+        candidate = state.drafted_tokens[
+            base_token_index : base_token_index + state.window_size
+        ]
+        if not candidate:
+            return None
+        blocked_tokens = self._compute_blocked_tokens_for_prefix(state)
+        frontier_token = int(candidate[0])
+        if frontier_token in blocked_tokens:
+            return frontier_token
+        return None
+
+    def _is_candidate_first_token_sendable(
+        self,
+        state: DasdRequestState,
+        base_token_index: int,
+        candidate: list[int],
+    ) -> tuple[bool, str]:
+        if not candidate:
+            return False, "empty_candidate"
+        if len(candidate) < state.window_size:
+            return False, "candidate_out_of_bounds"
+        if (
+            state.frontier_sync_active
+            and not self._is_frontier_sync_send_allowed(state, base_token_index)
+        ):
+            return False, "frontier_sync_send_blocked"
+        if base_token_index < 0:
+            return False, "candidate_out_of_bounds"
+        if not self._validate_dasd_token_ids(
+            state,
+            candidate,
+            source_path="alternative_frontier_candidate",
+            bundle_id=state.next_bundle_id,
+            base_token_index=base_token_index,
+        ):
+            return False, "candidate_invalid"
+        blocked_tokens = self._compute_blocked_tokens_for_prefix(state)
+        if int(candidate[0]) in blocked_tokens:
+            return False, "candidate_first_token_blocked"
+        return True, "sendable"
+
+    def _install_alternative_frontier_suffix(
+        self,
+        state: DasdRequestState,
+        candidate: list[int],
+        reason: str,
+    ):
+        state.drafted_tokens = state.drafted_tokens[: state.committed_len]
+        state.drafted_tokens.extend(candidate)
+        state.next_base_index = state.committed_len
+        self._clear_suffix_refresh_anchor(state)
+        self._reset_suppressed_retry_loop_state(
+            state, reason="alternative_frontier_installed"
+        )
+        state.alternative_frontier_last_reason = reason
+
+    def _extract_ranked_path_token_candidates_for_dasd(
+        self,
+        state: DasdRequestState,
+        *,
+        max_candidates: int = 3,
+    ) -> list[list[int]]:
+        if self._tree.end <= self._tree.prefix_len:
+            return []
+
+        all_indices = torch.arange(
+            self._tree.prefix_len, self._tree.end, dtype=torch.long, device=self._device
+        )
+        parent_mask = torch.zeros(self._tree.end, dtype=torch.bool, device=self._device)
+        parent_mask[self._tree.parents[self._tree.prefix_len : self._tree.end]] = True
+        leaf_indices = all_indices[~parent_mask[all_indices]]
+        if leaf_indices.numel() == 0:
+            leaf_indices = all_indices
+        if leaf_indices.numel() == 0:
+            return []
+
+        leaf_depths = self._tree.positions[leaf_indices]
+        leaf_scores = self._tree.logprobs[leaf_indices]
+        sort_order = sorted(
+            range(leaf_indices.numel()),
+            key=lambda idx: (
+                int(leaf_depths[idx].item()),
+                float(leaf_scores[idx].item()),
+            ),
+            reverse=True,
+        )
+
+        candidates: list[list[int]] = []
+        seen_paths: set[tuple[int, ...]] = set()
+        seen_first_tokens: set[int] = set()
+        for idx in sort_order:
+            leaf_idx = int(leaf_indices[idx].item())
+            path_indices = []
+            cursor = leaf_idx
+            while cursor >= self._tree.prefix_len:
+                path_indices.append(cursor)
+                cursor = int(self._tree.parents[cursor].item())
+            if not path_indices:
+                continue
+            path_indices.reverse()
+            path = self._tree.tokens[
+                torch.tensor(path_indices, dtype=torch.long, device=self._device)
+            ].tolist()
+            if not path:
+                continue
+            path_key = tuple(path)
+            if path_key in seen_paths:
+                continue
+            first_token = int(path[0])
+            if first_token in seen_first_tokens:
+                continue
+            seen_paths.add(path_key)
+            seen_first_tokens.add(first_token)
+            candidates.append(path)
+            if len(candidates) >= max_candidates:
+                break
+        return candidates
+
+    def _search_alternative_frontier_for_blocked_base(
+        self,
+        state: DasdRequestState,
+        reason: str,
+        max_candidate_tries: int = 3,
+    ):
+        base_token_index = state.committed_len
+        blocked_token_id = self._get_frontier_blocked_token_id(state)
+        state.alternative_frontier_search_count += 1
+        state.alternative_frontier_last_reason = reason
+        self._log_dasd_state_event(
+            "alternative_frontier_search_begin",
+            state,
+            decision_reason=reason,
+            base_token_index=base_token_index,
+            blocked_token=blocked_token_id,
+            max_candidate_tries=max_candidate_tries,
+        )
+
+        state.alternative_frontier_rebuild_count += 1
+        self._reset_tree_from_dasd_state(state, use_full_drafted=False)
+        with self._dasd_tree_budget_context(state):
+            self._grow_tree(prefill=True)
+        self._log_dasd_leaf_candidates(state)
+
+        candidates = self._extract_ranked_path_token_candidates_for_dasd(
+            state,
+            max_candidates=max_candidate_tries,
+        )
+        candidate_first_tokens = tuple(
+            int(candidate[0]) for candidate in candidates if candidate
+        )
+        if (
+            state.alternative_frontier_last_committed_len == state.committed_len
+            and state.alternative_frontier_last_blocked_token_id == blocked_token_id
+            and state.alternative_frontier_last_candidate_first_tokens
+            == candidate_first_tokens
+        ):
+            state.alternative_frontier_search_fail_count += 1
+            state.alternative_frontier_last_reason = (
+                "frontier_token_blocked_no_alternative"
+            )
+            self._log_dasd_state_event(
+                "alternative_frontier_search_fail",
+                state,
+                decision_reason="repeated_candidate_signature",
+                base_token_index=base_token_index,
+                blocked_token=blocked_token_id,
+                candidate_first_tokens=candidate_first_tokens,
+            )
+            return False, "frontier_token_blocked_no_alternative"
+
+        state.alternative_frontier_last_committed_len = state.committed_len
+        state.alternative_frontier_last_blocked_token_id = blocked_token_id
+        state.alternative_frontier_last_candidate_first_tokens = candidate_first_tokens
+
+        for attempt, candidate in enumerate(candidates[:max_candidate_tries], start=1):
+            candidate_len = min(len(candidate), state.window_size)
+            candidate_prefix = candidate[:candidate_len]
+            sendable, candidate_reason = self._is_candidate_first_token_sendable(
+                state,
+                base_token_index,
+                candidate_prefix,
+            )
+            self._log_dasd_state_event(
+                "alternative_frontier_candidate",
+                state,
+                decision_reason=candidate_reason,
+                base_token_index=base_token_index,
+                blocked_token=blocked_token_id,
+                candidate_first_token=(
+                    int(candidate_prefix[0]) if candidate_prefix else None
+                ),
+                candidate_len=candidate_len,
+                attempt=attempt,
+            )
+            if sendable:
+                self._install_alternative_frontier_suffix(
+                    state,
+                    candidate,
+                    reason="alternative_frontier_found",
+                )
+                state.alternative_frontier_search_success_count += 1
+                state.alternative_frontier_last_reason = "alternative_frontier_found"
+                self._log_dasd_state_event(
+                    "alternative_frontier_search_success",
+                    state,
+                    decision_reason="alternative_frontier_found",
+                    base_token_index=base_token_index,
+                    blocked_token=blocked_token_id,
+                    candidate_first_token=int(candidate_prefix[0]),
+                    candidate_len=len(candidate),
+                    attempt=attempt,
+                )
+                return True, "alternative_frontier_found"
+            state.alternative_frontier_candidate_reject_count += 1
+            if candidate_reason == "candidate_first_token_blocked":
+                state.alternative_frontier_blocked_first_token_count += 1
+            self._log_dasd_state_event(
+                "alternative_frontier_candidate_rejected",
+                state,
+                decision_reason=candidate_reason,
+                base_token_index=base_token_index,
+                blocked_token=blocked_token_id,
+                candidate_first_token=(
+                    int(candidate_prefix[0]) if candidate_prefix else None
+                ),
+                candidate_len=candidate_len,
+                attempt=attempt,
+            )
+
+        state.alternative_frontier_search_fail_count += 1
+        state.alternative_frontier_last_reason = "frontier_token_blocked_no_alternative"
+        self._log_dasd_state_event(
+            "alternative_frontier_search_fail",
+            state,
+            decision_reason="frontier_token_blocked_no_alternative",
+            base_token_index=base_token_index,
+            blocked_token=blocked_token_id,
+            candidate_first_tokens=candidate_first_tokens,
+        )
+        return False, "frontier_token_blocked_no_alternative"
+
     def _has_sendable_novel_frontier_after_refresh(
         self,
         state: DasdRequestState,
@@ -1180,6 +1431,20 @@ class SpecExecClient:
             sendable_after_refresh, frontier_reason = (
                 self._has_sendable_novel_frontier_after_refresh(state)
             )
+            if frontier_reason == "frontier_token_blocked_after_refresh":
+                alternative_found, alternative_reason = (
+                    self._search_alternative_frontier_for_blocked_base(
+                        state,
+                        reason="suffix_refresh_frontier_blocked",
+                    )
+                )
+                if alternative_found:
+                    sendable_after_refresh, frontier_reason = (
+                        self._has_sendable_novel_frontier_after_refresh(state)
+                    )
+                else:
+                    sendable_after_refresh = False
+                    frontier_reason = alternative_reason
             if not sendable_after_refresh:
                 state.suffix_refresh_fail_count += 1
                 self._log_dasd_state_event(
@@ -1352,6 +1617,27 @@ class SpecExecClient:
                 phase=reason,
                 allow_regeneration=False,
             )
+            if (
+                not state.inflight
+                and refill_result.get("reason") in {
+                    "frontier_token_blocked",
+                    "frontier_token_blocked_no_alternative",
+                }
+            ):
+                alternative_found, alternative_reason = (
+                    self._search_alternative_frontier_for_blocked_base(
+                        state,
+                        reason="rebuild_recovery_frontier_blocked",
+                    )
+                )
+                if alternative_found:
+                    refill_result = await self._fill_inflight_for_dasd(
+                        state,
+                        phase=reason,
+                        allow_regeneration=False,
+                    )
+                else:
+                    state.last_recovery_failure_reason = alternative_reason
             if state.inflight:
                 state.refill_success_count += 1
                 state.recovery_resume_success_count += 1
@@ -1732,6 +2018,7 @@ class SpecExecClient:
             finish_status = "refill_not_possible"
         state.finish_status = finish_status
         self._log_finish_condition(state, reason=finish_status)
+        self._reset_alternative_frontier_search_state(state, reason=finish_status)
         self._exit_pipeline_resume_grace(
             state,
             reason=finish_status,
@@ -1873,6 +2160,13 @@ class SpecExecClient:
                 "healthy_pipeline_entry_count": state.healthy_pipeline_entry_count,
                 "healthy_pipeline_exit_count": state.healthy_pipeline_exit_count,
                 "healthy_pipeline_send_count": state.healthy_pipeline_send_count,
+                "alternative_frontier_search_count": state.alternative_frontier_search_count,
+                "alternative_frontier_search_success_count": state.alternative_frontier_search_success_count,
+                "alternative_frontier_search_fail_count": state.alternative_frontier_search_fail_count,
+                "alternative_frontier_candidate_reject_count": state.alternative_frontier_candidate_reject_count,
+                "alternative_frontier_blocked_first_token_count": state.alternative_frontier_blocked_first_token_count,
+                "alternative_frontier_rebuild_count": state.alternative_frontier_rebuild_count,
+                "alternative_frontier_last_reason": state.alternative_frontier_last_reason,
                 "cooldown_active": state.cooldown_active,
                 "cooldown_entry_count": state.cooldown_entry_count,
                 "cooldown_exit_count": state.cooldown_exit_count,
@@ -2469,6 +2763,9 @@ class SpecExecClient:
         state.next_base_index = state.committed_len
         self._clear_suffix_refresh_anchor(state)
         self._reset_suppressed_retry_loop_state(state, reason="fallback_burst_progress")
+        self._reset_alternative_frontier_search_state(
+            state, reason="fallback_burst_progress"
+        )
         state.consecutive_full_rejections = 0
         state.rollback_blocked_committed_len = None
         state.rollback_blocked_token_id = None
@@ -2636,6 +2933,9 @@ class SpecExecClient:
         state.next_base_index = state.committed_len
         self._clear_suffix_refresh_anchor(state)
         self._reset_suppressed_retry_loop_state(state, reason="forced_commit_progress")
+        self._reset_alternative_frontier_search_state(
+            state, reason="forced_commit_progress"
+        )
         state.consecutive_full_rejections = 0
         state.rollback_blocked_committed_len = None
         state.rollback_blocked_token_id = None
@@ -2898,6 +3198,34 @@ class SpecExecClient:
                     reason=last_reason,
                 )
                 break
+            elif send_reason == "frontier_token_blocked":
+                if (
+                    state.next_base_index == state.committed_len
+                    and not state.inflight
+                ):
+                    alternative_found, alternative_reason = (
+                        self._search_alternative_frontier_for_blocked_base(
+                            state,
+                            reason=f"{phase}_frontier_token_blocked",
+                        )
+                    )
+                    last_reason = alternative_reason
+                    if alternative_found:
+                        continue
+                    self._log_refill_decision(
+                        state,
+                        phase=phase,
+                        action="no_work",
+                        reason=last_reason,
+                    )
+                    break
+                self._log_refill_decision(
+                    state,
+                    phase=phase,
+                    action="skipped",
+                    reason=send_reason,
+                )
+                break
             elif send_reason != "request_aborted":
                 self._log_refill_decision(
                     state,
@@ -3101,6 +3429,7 @@ class SpecExecClient:
         state.next_base_index += state.window_size
         state.cleanup_induced_drain = False
         self._reset_suppressed_retry_loop_state(state, reason="send_spawned")
+        self._reset_alternative_frontier_search_state(state, reason="send_spawned")
         if state.cleanup_reason == "rollback_cleanup" and not state.frontier_sync_active:
             self._enter_pipeline_resume_grace(
                 state,
@@ -3355,6 +3684,9 @@ class SpecExecClient:
             if accepted_len > 0:
                 self._clear_suffix_refresh_anchor(state)
                 self._reset_suppressed_retry_loop_state(state, reason="committed_progress")
+                self._reset_alternative_frontier_search_state(
+                    state, reason="committed_progress"
+                )
                 self._exit_pipeline_resume_grace(
                     state,
                     reason="committed_progress",
@@ -3681,6 +4013,10 @@ class SpecExecClient:
                     state,
                     reason="rollback_cleanup_escalated",
                 )
+                self._reset_alternative_frontier_search_state(
+                    state,
+                    reason="rollback_cleanup_escalated",
+                )
                 self._exit_pipeline_resume_grace(
                     state,
                     reason="rollback_cleanup_escalated",
@@ -3737,6 +4073,7 @@ class SpecExecClient:
             return
         state.aborted = True
         self._clear_suffix_refresh_anchor(state)
+        self._reset_alternative_frontier_search_state(state, reason=reason)
         self._exit_pipeline_resume_grace(state, reason=reason, success=False)
         self._reset_recovery_resend_relax_state(state, reason=reason)
         self._exit_frontier_sync(state, reason=reason, success=False)

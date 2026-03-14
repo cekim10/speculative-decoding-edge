@@ -299,6 +299,16 @@ class DasdRequestState:
     healthy_pipeline_entry_count: int = 0
     healthy_pipeline_exit_count: int = 0
     healthy_pipeline_send_count: int = 0
+    alternative_frontier_search_count: int = 0
+    alternative_frontier_search_success_count: int = 0
+    alternative_frontier_search_fail_count: int = 0
+    alternative_frontier_candidate_reject_count: int = 0
+    alternative_frontier_blocked_first_token_count: int = 0
+    alternative_frontier_rebuild_count: int = 0
+    alternative_frontier_last_reason: str = ""
+    alternative_frontier_last_committed_len: int | None = None
+    alternative_frontier_last_blocked_token_id: int | None = None
+    alternative_frontier_last_candidate_first_tokens: tuple[int, ...] | None = None
     cooldown_active: bool = False
     cooldown_entry_count: int = 0
     cooldown_exit_count: int = 0

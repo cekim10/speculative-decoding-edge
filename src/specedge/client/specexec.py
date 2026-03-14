@@ -386,14 +386,17 @@ class SpecExecClient:
     def _is_dasd_unstable(self, state: DasdRequestState, base_token_index: Optional[int] = None):
         base = state.committed_len if base_token_index is None else base_token_index
         return (
-            state.local_stabilization_active
-            or state.cooldown_active
+            state.frontier_sync_active
+            or state.local_stabilization_active
             or state.recovery_mode_active
-            or state.consecutive_full_rejections > 0
-            or state.base_retry_counts.get(base, 0) > 1
+            or state.consecutive_full_rejections >= 2
+            or state.base_retry_counts.get(base, 0)
+            >= max(3, config.dasd_recovery_same_base_retry_threshold)
+            or state.suppressed_retry_loop_count > 0
         )
 
     def _current_dasd_inflight_cap(self, state: DasdRequestState):
+        conservative_mode = self._update_pipeline_mode(state)
         if state.frontier_sync_active:
             state.frontier_sync_inflight_cap_hits += 1
             self._log_dasd_state_event(
@@ -406,7 +409,7 @@ class SpecExecClient:
                 inflight_cap=1,
             )
             return 1
-        if self._is_dasd_unstable(state):
+        if conservative_mode:
             state.unstable_phase_inflight_cap_hits += 1
             self._log_dasd_state_event(
                 "unstable_inflight_cap_applied",
@@ -507,6 +510,201 @@ class SpecExecClient:
                 decision_reason=reason,
                 base_token_index=state.committed_len,
             )
+
+    def _enter_pipeline_resume_grace(
+        self, state: DasdRequestState, reason: str, sends: int = 2
+    ):
+        if state.pipeline_resume_grace_active:
+            state.pipeline_resume_grace_sends_remaining = max(
+                state.pipeline_resume_grace_sends_remaining,
+                max(1, sends),
+            )
+            state.pipeline_resume_grace_reason = reason
+            state.last_pipeline_resume_reason = reason
+            self._log_dasd_state_event(
+                "pipeline_resume_grace_enter",
+                state,
+                decision_reason=reason,
+                base_token_index=state.committed_len,
+                remaining_sends=state.pipeline_resume_grace_sends_remaining,
+            )
+            return
+        state.pipeline_resume_grace_active = True
+        state.pipeline_resume_grace_sends_remaining = max(1, sends)
+        state.pipeline_resume_grace_reason = reason
+        state.pipeline_resume_grace_entry_count += 1
+        state.last_pipeline_resume_reason = reason
+        self._log_dasd_state_event(
+            "pipeline_resume_grace_enter",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            remaining_sends=state.pipeline_resume_grace_sends_remaining,
+        )
+
+    def _exit_pipeline_resume_grace(
+        self, state: DasdRequestState, reason: str, success: bool
+    ):
+        if not state.pipeline_resume_grace_active:
+            return
+        state.pipeline_resume_grace_active = False
+        state.pipeline_resume_grace_sends_remaining = 0
+        state.pipeline_resume_grace_reason = ""
+        state.pipeline_resume_grace_exit_count += 1
+        if success:
+            state.pipeline_resume_grace_success_count += 1
+        else:
+            state.pipeline_resume_grace_fail_count += 1
+        state.last_pipeline_resume_reason = reason
+        self._log_dasd_state_event(
+            "pipeline_resume_grace_exit",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            success=success,
+        )
+
+    def _consume_pipeline_resume_grace_send(
+        self, state: DasdRequestState, reason: str
+    ):
+        if not state.pipeline_resume_grace_active:
+            return
+        state.pipeline_resume_grace_sends_remaining = max(
+            0, state.pipeline_resume_grace_sends_remaining - 1
+        )
+        state.last_pipeline_resume_reason = reason
+        self._log_dasd_state_event(
+            "pipeline_resume_grace_progress",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            remaining_sends=state.pipeline_resume_grace_sends_remaining,
+        )
+        if state.pipeline_resume_grace_sends_remaining == 0:
+            self._exit_pipeline_resume_grace(
+                state,
+                reason="pipeline_resume_grace_consumed",
+                success=True,
+            )
+
+    def _enter_recovery_resend_relax(
+        self, state: DasdRequestState, reason: str, attempts: int = 2
+    ):
+        if state.recovery_resend_relax_active:
+            state.recovery_resend_relax_attempts_remaining = max(
+                state.recovery_resend_relax_attempts_remaining,
+                max(1, attempts),
+            )
+            state.recovery_resend_relax_reason = reason
+            state.last_recovery_resend_relax_reason = reason
+            self._log_dasd_state_event(
+                "recovery_resend_relax_enter",
+                state,
+                decision_reason=reason,
+                base_token_index=state.committed_len,
+                remaining_attempts=state.recovery_resend_relax_attempts_remaining,
+            )
+            return
+        state.recovery_resend_relax_active = True
+        state.recovery_resend_relax_attempts_remaining = max(1, attempts)
+        state.recovery_resend_relax_reason = reason
+        state.recovery_resend_relax_entry_count += 1
+        state.last_recovery_resend_relax_reason = reason
+        self._log_dasd_state_event(
+            "recovery_resend_relax_enter",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            remaining_attempts=state.recovery_resend_relax_attempts_remaining,
+        )
+
+    def _exit_recovery_resend_relax(self, state: DasdRequestState, reason: str):
+        if not state.recovery_resend_relax_active:
+            return
+        state.recovery_resend_relax_active = False
+        state.recovery_resend_relax_attempts_remaining = 0
+        state.recovery_resend_relax_reason = ""
+        state.recovery_resend_relax_exit_count += 1
+        state.last_recovery_resend_relax_reason = reason
+        self._log_dasd_state_event(
+            "recovery_resend_relax_exit",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+        )
+
+    def _reset_recovery_resend_relax_state(self, state: DasdRequestState, reason: str):
+        self._exit_recovery_resend_relax(state, reason=reason)
+
+    def _should_relax_recovery_resend_suppression(
+        self,
+        state: DasdRequestState,
+        *,
+        base_token_index: int,
+        token_ids: list[int],
+        retry_quality_reason: str,
+    ) -> bool:
+        if not state.recovery_resend_relax_active:
+            return False
+        if state.recovery_resend_relax_attempts_remaining <= 0:
+            self._exit_recovery_resend_relax(
+                state,
+                reason="attempt_budget_exhausted",
+            )
+            return False
+        if base_token_index != state.committed_len:
+            return False
+        if not token_ids:
+            return False
+        blocked_tokens = self._compute_blocked_tokens_for_prefix(state)
+        if token_ids[0] in blocked_tokens:
+            return False
+        if retry_quality_reason not in {
+            "duplicate_retry_fingerprint",
+            "low_value_same_base_retry",
+            "same_base_retry",
+            "low_value_retry_suppressed",
+        }:
+            return False
+        return True
+
+    def _should_use_conservative_single_frontier_mode(
+        self, state: DasdRequestState
+    ):
+        return (
+            state.frontier_sync_active
+            or state.cleanup_induced_drain
+            or (
+                (state.local_stabilization_active or state.recovery_mode_active)
+                and not state.pipeline_resume_grace_active
+            )
+        )
+
+    def _update_pipeline_mode(self, state: DasdRequestState):
+        conservative = self._should_use_conservative_single_frontier_mode(state)
+        if conservative:
+            if state.healthy_pipeline_active:
+                state.healthy_pipeline_active = False
+                state.healthy_pipeline_exit_count += 1
+                self._log_dasd_state_event(
+                    "conservative_pipeline_mode",
+                    state,
+                    decision_reason="exit_healthy_pipeline",
+                    base_token_index=state.committed_len,
+                    inflight_cap=1,
+                )
+        else:
+            if not state.healthy_pipeline_active:
+                state.healthy_pipeline_active = True
+                state.healthy_pipeline_entry_count += 1
+                self._log_dasd_state_event(
+                    "healthy_pipeline_mode",
+                    state,
+                    decision_reason="enter_healthy_pipeline",
+                    base_token_index=state.committed_len,
+                    inflight_cap=config.dasd_max_inflight_bundles,
+                )
+        return conservative
 
     def _enter_frontier_sync(self, state: DasdRequestState, reason: str):
         if state.frontier_sync_active:
@@ -1000,7 +1198,13 @@ class SpecExecClient:
             state.suffix_refresh_success_count += 1
             state.rollback_cleanup_avoided_count += 1
             state.cheap_recovery_success_count += 1
-            self._enter_frontier_sync(state, reason="suffix_refresh_success")
+            self._exit_local_stabilization(
+                state,
+                reason="suffix_refresh_success",
+                success=True,
+            )
+            self._enter_pipeline_resume_grace(state, reason="suffix_refresh_success")
+            self._enter_recovery_resend_relax(state, reason="suffix_refresh_success")
             self._log_dasd_state_event(
                 "suffix_refresh_end",
                 state,
@@ -1135,6 +1339,14 @@ class SpecExecClient:
                     reason,
                 )
 
+            self._enter_pipeline_resume_grace(
+                state,
+                reason="rebuild_recovery_success",
+            )
+            self._enter_recovery_resend_relax(
+                state,
+                reason="rebuild_recovery_success",
+            )
             refill_result = await self._fill_inflight_for_dasd(
                 state,
                 phase=reason,
@@ -1143,15 +1355,13 @@ class SpecExecClient:
             if state.inflight:
                 state.refill_success_count += 1
                 state.recovery_resume_success_count += 1
-                self._enter_frontier_sync(state, reason="rebuild_recovery_success")
-                state.frontier_sync_resume_count += 1
-                self._log_dasd_state_event(
-                    "frontier_sync_resume",
+                self._enter_pipeline_resume_grace(
                     state,
-                    decision_reason="rebuild_recovery_success",
-                    base_token_index=state.committed_len,
-                    target_committed_len=state.frontier_sync_target_committed_len,
-                    remaining_progress=state.frontier_sync_progress_remaining,
+                    reason="rebuild_recovery_success",
+                )
+                self._enter_recovery_resend_relax(
+                    state,
+                    reason="rebuild_recovery_success",
                 )
                 self._exit_local_stabilization(state, reason="rebuild_recovery_success", success=True)
                 self._enter_cooldown(state, reason="rebuild_recovery_success")
@@ -1177,6 +1387,15 @@ class SpecExecClient:
                     send_spawn_count=refill_result.get("send_spawn_count", 0),
                 )
                 return True
+            self._exit_pipeline_resume_grace(
+                state,
+                reason="rebuild_recovery_no_send",
+                success=False,
+            )
+            self._exit_recovery_resend_relax(
+                state,
+                reason="rebuild_recovery_no_send",
+            )
 
         state.refill_skip_count += 1
         state.recovery_resume_fail_count += 1
@@ -1513,6 +1732,12 @@ class SpecExecClient:
             finish_status = "refill_not_possible"
         state.finish_status = finish_status
         self._log_finish_condition(state, reason=finish_status)
+        self._exit_pipeline_resume_grace(
+            state,
+            reason=finish_status,
+            success=finish_status in {"eos_reached", "max_new_tokens_reached"},
+        )
+        self._reset_recovery_resend_relax_state(state, reason=finish_status)
         self._exit_frontier_sync(
             state,
             reason=finish_status,
@@ -1637,6 +1862,17 @@ class SpecExecClient:
                 "frontier_sync_send_gate_block_count": state.frontier_sync_send_gate_block_count,
                 "frontier_sync_inflight_cap_hits": state.frontier_sync_inflight_cap_hits,
                 "frontier_sync_resume_count": state.frontier_sync_resume_count,
+                "pipeline_resume_grace_entry_count": state.pipeline_resume_grace_entry_count,
+                "pipeline_resume_grace_exit_count": state.pipeline_resume_grace_exit_count,
+                "pipeline_resume_grace_success_count": state.pipeline_resume_grace_success_count,
+                "pipeline_resume_grace_fail_count": state.pipeline_resume_grace_fail_count,
+                "recovery_resend_relax_entry_count": state.recovery_resend_relax_entry_count,
+                "recovery_resend_relax_exit_count": state.recovery_resend_relax_exit_count,
+                "recovery_resend_relax_used_count": state.recovery_resend_relax_used_count,
+                "recovery_resend_relax_block_bypass_count": state.recovery_resend_relax_block_bypass_count,
+                "healthy_pipeline_entry_count": state.healthy_pipeline_entry_count,
+                "healthy_pipeline_exit_count": state.healthy_pipeline_exit_count,
+                "healthy_pipeline_send_count": state.healthy_pipeline_send_count,
                 "cooldown_active": state.cooldown_active,
                 "cooldown_entry_count": state.cooldown_entry_count,
                 "cooldown_exit_count": state.cooldown_exit_count,
@@ -1659,6 +1895,8 @@ class SpecExecClient:
                 "last_cooldown_reason": state.last_cooldown_reason,
                 "last_retry_quality_reason": state.last_retry_quality_reason,
                 "last_frontier_sync_reason": state.last_frontier_sync_reason,
+                "last_pipeline_resume_reason": state.last_pipeline_resume_reason,
+                "last_recovery_resend_relax_reason": state.last_recovery_resend_relax_reason,
                 "average_W": (
                     state.sum_window_at_send / state.verify_rounds
                     if state.verify_rounds > 0
@@ -2238,6 +2476,8 @@ class SpecExecClient:
         state.base_retry_counts.pop(base_token_index, None)
         self._reset_tree_from_dasd_state(state, use_full_drafted=False)
         self._enter_frontier_sync(state, reason="fallback_burst_progress")
+        self._enter_pipeline_resume_grace(state, reason="fallback_burst_progress")
+        self._enter_recovery_resend_relax(state, reason="fallback_burst_progress")
         blocked_tokens = sorted(self._blocked_tokens_for_prefix(state))
         if config.dasd_debug:
             prefix_tail = state.drafted_tokens[max(0, state.committed_len - 8) : state.committed_len]
@@ -2421,6 +2661,8 @@ class SpecExecClient:
             sync_token_id=token_id,
         )
         self._enter_frontier_sync(state, reason="forced_commit_progress")
+        self._enter_pipeline_resume_grace(state, reason="forced_commit_success")
+        self._enter_recovery_resend_relax(state, reason="forced_commit_success")
         self._exit_local_stabilization(
             state,
             reason="forced_commit_progress",
@@ -2718,6 +2960,10 @@ class SpecExecClient:
         if len(token_ids) < state.window_size:
             state.bundle_build_none_count += 1
             return False, "drafted_len_not_ahead_of_committed"
+        blocked_tokens = self._compute_blocked_tokens_for_prefix(state)
+        if token_ids and token_ids[0] in blocked_tokens:
+            state.last_retry_decision_reason = "frontier_token_blocked"
+            return False, "frontier_token_blocked"
         if not self._validate_dasd_token_ids(
             state,
             token_ids,
@@ -2760,20 +3006,49 @@ class SpecExecClient:
                 unique_fingerprints=unique_fingerprints,
             )
         )
+        relaxed_suppression = False
         if short_circuit_retry:
-            state.low_value_retry_suppressed_count += 1
-            state.same_base_retry_short_circuit_count += 1
-            state.last_retry_quality_reason = retry_quality_reason
-            state.last_retry_decision_reason = retry_quality_reason
-            self._log_dasd_state_event(
-                "retry_quality_suppressed",
+            if self._should_relax_recovery_resend_suppression(
                 state,
-                decision_reason=retry_quality_reason,
                 base_token_index=base_token_index,
-                fingerprint_attempts=fingerprint_attempts,
-                unique_retry_fingerprints=unique_fingerprints,
-            )
-            return False, "low_value_retry_suppressed"
+                token_ids=token_ids,
+                retry_quality_reason=retry_quality_reason,
+            ):
+                relaxed_suppression = True
+                state.recovery_resend_relax_used_count += 1
+                state.recovery_resend_relax_block_bypass_count += 1
+                state.recovery_resend_relax_attempts_remaining = max(
+                    0, state.recovery_resend_relax_attempts_remaining - 1
+                )
+                self._log_dasd_state_event(
+                    "recovery_resend_relax_bypass",
+                    state,
+                    decision_reason=retry_quality_reason,
+                    base_token_index=base_token_index,
+                    remaining_attempts=state.recovery_resend_relax_attempts_remaining,
+                    suppression_bypassed=True,
+                )
+                if state.recovery_resend_relax_attempts_remaining == 0:
+                    self._exit_recovery_resend_relax(
+                        state,
+                        reason="attempt_budget_exhausted",
+                    )
+            else:
+                state.low_value_retry_suppressed_count += 1
+                state.same_base_retry_short_circuit_count += 1
+                state.last_retry_quality_reason = retry_quality_reason
+                state.last_retry_decision_reason = retry_quality_reason
+                self._log_dasd_state_event(
+                    "retry_quality_suppressed",
+                    state,
+                    decision_reason=retry_quality_reason,
+                    base_token_index=base_token_index,
+                    fingerprint_attempts=fingerprint_attempts,
+                    unique_retry_fingerprints=unique_fingerprints,
+                )
+                return False, "low_value_retry_suppressed"
+        if relaxed_suppression:
+            state.last_retry_decision_reason = "recovery_resend_relax_bypass"
 
         send_ts = time.perf_counter()
         task = asyncio.create_task(
@@ -2827,16 +3102,17 @@ class SpecExecClient:
         state.cleanup_induced_drain = False
         self._reset_suppressed_retry_loop_state(state, reason="send_spawned")
         if state.cleanup_reason == "rollback_cleanup" and not state.frontier_sync_active:
-            self._enter_frontier_sync(state, reason="rollback_cleanup_resume")
-            state.frontier_sync_resume_count += 1
-            self._log_dasd_state_event(
-                "frontier_sync_resume",
+            self._enter_pipeline_resume_grace(
                 state,
-                decision_reason="rollback_cleanup_resume",
-                base_token_index=base_token_index,
-                target_committed_len=state.frontier_sync_target_committed_len,
-                remaining_progress=state.frontier_sync_progress_remaining,
+                reason="rollback_cleanup_resume",
             )
+            self._enter_recovery_resend_relax(
+                state,
+                reason="rollback_cleanup_resume",
+            )
+        self._consume_pipeline_resume_grace_send(state, reason="send_spawned")
+        if state.healthy_pipeline_active:
+            state.healthy_pipeline_send_count += 1
         if state.local_stabilization_active:
             self._log_dasd_state_event(
                 "local_stabilization_retry",
@@ -3079,6 +3355,15 @@ class SpecExecClient:
             if accepted_len > 0:
                 self._clear_suffix_refresh_anchor(state)
                 self._reset_suppressed_retry_loop_state(state, reason="committed_progress")
+                self._exit_pipeline_resume_grace(
+                    state,
+                    reason="committed_progress",
+                    success=True,
+                )
+                self._reset_recovery_resend_relax_state(
+                    state,
+                    reason="committed_progress",
+                )
                 self._record_frontier_sync_progress(
                     state,
                     reason="committed_progress",
@@ -3396,6 +3681,15 @@ class SpecExecClient:
                     state,
                     reason="rollback_cleanup_escalated",
                 )
+                self._exit_pipeline_resume_grace(
+                    state,
+                    reason="rollback_cleanup_escalated",
+                    success=False,
+                )
+                self._reset_recovery_resend_relax_state(
+                    state,
+                    reason="rollback_cleanup_escalated",
+                )
                 self._prepare_dasd_refill_from_committed(
                     state, reason="rollback_cleanup"
                 )
@@ -3443,6 +3737,8 @@ class SpecExecClient:
             return
         state.aborted = True
         self._clear_suffix_refresh_anchor(state)
+        self._exit_pipeline_resume_grace(state, reason=reason, success=False)
+        self._reset_recovery_resend_relax_state(state, reason=reason)
         self._exit_frontier_sync(state, reason=reason, success=False)
         if state.abort_reason == "":
             state.abort_reason = reason

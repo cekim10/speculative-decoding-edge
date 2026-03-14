@@ -373,6 +373,127 @@ class SpecExecClient:
             abandoned=lifecycle["abandoned"],
         )
 
+    def _conservative_dasd_tree_budget(self):
+        return DasdTreeBudget(
+            max_beam_len=max(1, min(self._fixed_max_beam_len, config.dasd_recovery_forced_tree_depth)),
+            max_budget=max(1, min(self._fixed_max_budget, config.dasd_recovery_forced_leaf_budget)),
+            max_n_beams=max(1, min(self._fixed_max_n_beams, config.dasd_recovery_forced_leaf_budget)),
+            max_branch_width=max(1, min(self._fixed_max_branch_width, config.dasd_recovery_forced_leaf_budget)),
+        )
+
+    def _is_dasd_unstable(self, state: DasdRequestState, base_token_index: Optional[int] = None):
+        base = state.committed_len if base_token_index is None else base_token_index
+        return (
+            state.local_stabilization_active
+            or state.cooldown_active
+            or state.recovery_mode_active
+            or state.consecutive_full_rejections > 0
+            or state.base_retry_counts.get(base, 0) > 1
+        )
+
+    def _current_dasd_inflight_cap(self, state: DasdRequestState):
+        if self._is_dasd_unstable(state):
+            state.unstable_phase_inflight_cap_hits += 1
+            self._log_dasd_state_event(
+                "unstable_inflight_cap_applied",
+                state,
+                decision_reason="unstable_phase",
+                base_token_index=state.committed_len,
+                inflight_cap=1,
+            )
+            return 1
+        return config.dasd_max_inflight_bundles
+
+    def _enter_local_stabilization(self, state: DasdRequestState, reason: str):
+        if state.local_stabilization_active:
+            return
+        state.local_stabilization_active = True
+        state.local_stabilization_attempt_count += 1
+        state.last_mitigation_decision_reason = reason
+        self._refresh_dasd_control_targets(
+            state,
+            reason="local_stabilization_enter",
+            next_credit=state.window_size,
+        )
+        self._log_dasd_state_event(
+            "local_stabilization_enter",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+        )
+
+    def _exit_local_stabilization(self, state: DasdRequestState, reason: str, success: bool):
+        if not state.local_stabilization_active:
+            return
+        state.local_stabilization_active = False
+        state.last_mitigation_decision_reason = reason
+        self._refresh_dasd_control_targets(
+            state,
+            reason="local_stabilization_exit",
+            next_credit=state.window_size,
+        )
+        if success:
+            state.local_stabilization_success_count += 1
+            self._log_dasd_state_event(
+                "local_stabilization_success",
+                state,
+                decision_reason=reason,
+                base_token_index=state.committed_len,
+            )
+        else:
+            state.local_stabilization_fail_count += 1
+            self._log_dasd_state_event(
+                "local_stabilization_fail",
+                state,
+                decision_reason=reason,
+                base_token_index=state.committed_len,
+            )
+
+    def _enter_cooldown(self, state: DasdRequestState, reason: str):
+        state.cooldown_active = True
+        state.cooldown_progress_remaining = 2
+        state.cooldown_entry_count += 1
+        state.last_cooldown_reason = reason
+        self._refresh_dasd_control_targets(
+            state,
+            reason="cooldown_enter",
+            next_credit=state.window_size,
+        )
+        self._log_dasd_state_event(
+            "cooldown_enter",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+        )
+
+    def _record_cooldown_progress(self, state: DasdRequestState, reason: str):
+        if not state.cooldown_active:
+            return
+        state.cooldown_progress_count += 1
+        state.cooldown_progress_remaining = max(0, state.cooldown_progress_remaining - 1)
+        self._log_dasd_state_event(
+            "cooldown_progress",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            remaining=state.cooldown_progress_remaining,
+        )
+        if state.cooldown_progress_remaining == 0:
+            state.cooldown_active = False
+            state.cooldown_exit_count += 1
+            state.last_cooldown_reason = reason
+            self._refresh_dasd_control_targets(
+                state,
+                reason="cooldown_exit",
+                next_credit=state.window_size,
+            )
+            self._log_dasd_state_event(
+                "cooldown_exit",
+                state,
+                decision_reason=reason,
+                base_token_index=state.committed_len,
+            )
+
     def _record_retry_fingerprint(
         self,
         state: DasdRequestState,
@@ -603,6 +724,101 @@ class SpecExecClient:
             )
         return False, last_reason
 
+    def _perform_suffix_refresh(self, state: DasdRequestState, reason: str):
+        state.suffix_refresh_attempt_count += 1
+        state.last_suffix_refresh_reason = reason
+        state.last_mitigation_decision_reason = reason
+        self._refresh_dasd_control_targets(
+            state,
+            reason="suffix_refresh_begin",
+            next_credit=state.window_size,
+        )
+        self._log_dasd_state_event(
+            "suffix_refresh_begin",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+        )
+        self._prepare_dasd_refill_from_committed(state, reason="suffix_refresh")
+        regenerated, regen_reason = self._regenerate_dasd_suffix(
+            state,
+            min_required_end=state.next_base_index + state.window_size,
+            phase="suffix_refresh",
+        )
+        if regenerated:
+            state.suffix_refresh_success_count += 1
+            state.rollback_cleanup_avoided_count += 1
+            state.cheap_recovery_success_count += 1
+            self._log_dasd_state_event(
+                "suffix_refresh_end",
+                state,
+                decision_reason="success",
+                base_token_index=state.committed_len,
+            )
+            self._log_dasd_state_event(
+                "suffix_refresh_success",
+                state,
+                decision_reason=reason,
+                base_token_index=state.committed_len,
+            )
+            self._enter_cooldown(state, reason="suffix_refresh_success")
+            return True, "suffix_refresh_success"
+        state.suffix_refresh_fail_count += 1
+        self._log_dasd_state_event(
+            "suffix_refresh_end",
+            state,
+            decision_reason=regen_reason,
+            base_token_index=state.committed_len,
+        )
+        self._log_dasd_state_event(
+            "suffix_refresh_fail",
+            state,
+            decision_reason=regen_reason,
+            base_token_index=state.committed_len,
+        )
+        return False, regen_reason
+
+    def _should_short_circuit_same_base_retry(
+        self,
+        state: DasdRequestState,
+        base_token_index: int,
+        fingerprint_attempts: int,
+        unique_fingerprints: int,
+    ):
+        if base_token_index != state.committed_len:
+            return False, ""
+        if state.base_retry_counts.get(base_token_index, 0) <= 1:
+            return False, ""
+        blocked_tokens = self._blocked_tokens_for_prefix(state)
+        if fingerprint_attempts >= 2 and state.consecutive_full_rejections > 0:
+            return True, "duplicate_retry_fingerprint"
+        if (
+            self._is_dasd_unstable(state, base_token_index=base_token_index)
+            and unique_fingerprints <= 2
+            and len(blocked_tokens) > 0
+            and state.base_retry_counts.get(base_token_index, 0) >= 2
+        ):
+            return True, "low_value_same_base_retry"
+        return False, ""
+
+    def _should_defer_rollback_cleanup(
+        self,
+        state: DasdRequestState,
+        base_token_index: int,
+        rollback_cause: str,
+    ):
+        if rollback_cause == "rollback_due_to_state_inconsistency":
+            return False
+        if rollback_cause == "rollback_due_to_contiguous_commit_mismatch":
+            return False
+        retry_count = state.base_retry_counts.get(base_token_index, 0)
+        defer_retry_limit = max(2, config.dasd_recovery_same_base_retry_threshold)
+        return (
+            state.local_stabilization_active
+            or state.recovery_mode_active
+            or retry_count <= defer_retry_limit
+        )
+
     async def _attempt_dasd_refill_recovery(
         self,
         state: DasdRequestState,
@@ -612,6 +828,8 @@ class SpecExecClient:
         if not self._can_continue_dasd_generation(state):
             self._log_finish_condition(state, reason=f"refill_skipped:{reason}")
             return False
+
+        state.expensive_recovery_count += 1
 
         if reason == "unexpected_empty_inflight":
             state.unexpected_empty_inflight_recovery_count += 1
@@ -671,6 +889,8 @@ class SpecExecClient:
             if state.inflight:
                 state.refill_success_count += 1
                 state.recovery_resume_success_count += 1
+                self._exit_local_stabilization(state, reason="rebuild_recovery_success", success=True)
+                self._enter_cooldown(state, reason="rebuild_recovery_success")
                 if config.dasd_debug:
                     self._logger.info(
                         "[DASD] recovery_resume_success req=%s epoch=%d committed=%d drafted=%d next_base=%d inflight=%d phase=%s",
@@ -696,6 +916,7 @@ class SpecExecClient:
 
         state.refill_skip_count += 1
         state.recovery_resume_fail_count += 1
+        self._exit_local_stabilization(state, reason="rebuild_recovery_failed", success=False)
         if config.dasd_debug:
             self._logger.info(
                 "[DASD] recovery_resume_fail req=%s epoch=%d committed=%d drafted=%d next_base=%d inflight=%d phase=%s reason=%s",
@@ -1128,10 +1349,33 @@ class SpecExecClient:
                 "forced_commit_failure_count": state.forced_commit_failure_count,
                 "failure_cache_block_decision_count": state.failure_cache_block_decision_count,
                 "failure_cache_blocked_same_base_retry_count": state.failure_cache_blocked_same_base_retry_count,
+                "local_stabilization_active": state.local_stabilization_active,
+                "local_stabilization_attempt_count": state.local_stabilization_attempt_count,
+                "local_stabilization_success_count": state.local_stabilization_success_count,
+                "local_stabilization_fail_count": state.local_stabilization_fail_count,
+                "suffix_refresh_attempt_count": state.suffix_refresh_attempt_count,
+                "suffix_refresh_success_count": state.suffix_refresh_success_count,
+                "suffix_refresh_fail_count": state.suffix_refresh_fail_count,
+                "rollback_cleanup_deferred_count": state.rollback_cleanup_deferred_count,
+                "rollback_cleanup_escalated_count": state.rollback_cleanup_escalated_count,
+                "rollback_cleanup_avoided_count": state.rollback_cleanup_avoided_count,
+                "cooldown_active": state.cooldown_active,
+                "cooldown_entry_count": state.cooldown_entry_count,
+                "cooldown_exit_count": state.cooldown_exit_count,
+                "cooldown_progress_count": state.cooldown_progress_count,
+                "unstable_phase_inflight_cap_hits": state.unstable_phase_inflight_cap_hits,
+                "low_value_retry_suppressed_count": state.low_value_retry_suppressed_count,
+                "same_base_retry_short_circuit_count": state.same_base_retry_short_circuit_count,
+                "cheap_recovery_success_count": state.cheap_recovery_success_count,
+                "expensive_recovery_count": state.expensive_recovery_count,
                 "last_rollback_cause": state.last_rollback_cause,
                 "last_retry_decision_reason": state.last_retry_decision_reason,
                 "last_recovery_mode_transition_reason": state.last_recovery_mode_transition_reason,
                 "last_forced_commit_decision_reason": state.last_forced_commit_decision_reason,
+                "last_mitigation_decision_reason": state.last_mitigation_decision_reason,
+                "last_suffix_refresh_reason": state.last_suffix_refresh_reason,
+                "last_cooldown_reason": state.last_cooldown_reason,
+                "last_retry_quality_reason": state.last_retry_quality_reason,
                 "average_W": (
                     state.sum_window_at_send / state.verify_rounds
                     if state.verify_rounds > 0
@@ -1221,26 +1465,24 @@ class SpecExecClient:
             fallback_max_branch_width=self._fixed_max_branch_width,
         )
 
+        if state.local_stabilization_active or state.cooldown_active:
+            conservative_budget = self._conservative_dasd_tree_budget()
+            state.window_size = max(1, min(state.window_size, config.dasd_recovery_forced_w))
+            state.tree_budget = conservative_budget
+            self._log_dasd_state_event(
+                "mitigation_decision",
+                state,
+                decision_reason=(
+                    "local_stabilization_active"
+                    if state.local_stabilization_active
+                    else "cooldown_active"
+                ),
+                base_token_index=state.committed_len,
+            )
+
         if state.recovery_mode_active and config.dasd_recovery_mode_enabled:
             state.window_size = max(1, config.dasd_recovery_forced_w)
-            state.tree_budget = DasdTreeBudget(
-                max_beam_len=max(1, min(self._fixed_max_beam_len, config.dasd_recovery_forced_tree_depth)),
-                max_budget=max(1, min(self._fixed_max_budget, config.dasd_recovery_forced_leaf_budget)),
-                max_n_beams=max(
-                    1,
-                    min(
-                        self._fixed_max_n_beams,
-                        config.dasd_recovery_forced_leaf_budget,
-                    ),
-                ),
-                max_branch_width=max(
-                    1,
-                    min(
-                        self._fixed_max_branch_width,
-                        config.dasd_recovery_forced_leaf_budget,
-                    ),
-                ),
-            )
+            state.tree_budget = self._conservative_dasd_tree_budget()
             if config.dasd_debug:
                 self._logger.info(
                     "[DASD] recovery_mode_active req=%s epoch=%d committed=%d reason=%s rounds_left=%d forced_W=%d forced_tree=%s",
@@ -1874,6 +2116,12 @@ class SpecExecClient:
             sync_base=base_token_index,
             sync_token_id=token_id,
         )
+        self._exit_local_stabilization(
+            state,
+            reason="forced_commit_progress",
+            success=True,
+        )
+        self._enter_cooldown(state, reason="forced_commit_success")
         self._exit_recovery_mode(state, reason="forced_commit_progress")
         if config.dasd_debug:
             self._logger.info(
@@ -1935,7 +2183,8 @@ class SpecExecClient:
                 action="guard_blocked",
                 reason="next_base_before_committed_corrected",
             )
-        if len(state.inflight) >= config.dasd_max_inflight_bundles:
+        inflight_cap = self._current_dasd_inflight_cap(state)
+        if len(state.inflight) >= inflight_cap:
             self._log_refill_decision(
                 state,
                 phase=phase,
@@ -1945,7 +2194,10 @@ class SpecExecClient:
             return {"reason": "max_inflight_reached", "send_spawn_count": 0}
         send_spawn_count = 0
         last_reason = "unknown_guard_blocked"
-        while len(state.inflight) < config.dasd_max_inflight_bundles:
+        while True:
+            inflight_cap = self._current_dasd_inflight_cap(state)
+            if len(state.inflight) >= inflight_cap:
+                break
             required_end = state.next_base_index + state.window_size
             if required_end > len(state.drafted_tokens):
                 if allow_regeneration:
@@ -1990,6 +2242,37 @@ class SpecExecClient:
                     reason="send_spawned",
                     send_spawn_count=send_spawn_count,
                 )
+            elif send_reason == "low_value_retry_suppressed":
+                state.rollback_cleanup_deferred_count += 1
+                state.last_mitigation_decision_reason = send_reason
+                self._log_dasd_state_event(
+                    "rollback_cleanup_deferred",
+                    state,
+                    decision_reason=send_reason,
+                    base_token_index=state.committed_len,
+                )
+                if not state.local_stabilization_active:
+                    self._enter_local_stabilization(state, reason=send_reason)
+                self._log_dasd_state_event(
+                    "local_stabilization_retry",
+                    state,
+                    decision_reason=send_reason,
+                    base_token_index=state.committed_len,
+                )
+                refreshed, refresh_reason = self._perform_suffix_refresh(
+                    state,
+                    reason=send_reason,
+                )
+                last_reason = refresh_reason
+                if refreshed:
+                    continue
+                self._log_refill_decision(
+                    state,
+                    phase=phase,
+                    action="no_work",
+                    reason=last_reason,
+                )
+                break
             elif send_reason != "request_aborted":
                 self._log_refill_decision(
                     state,
@@ -2074,6 +2357,28 @@ class SpecExecClient:
             fingerprint_attempts=fingerprint_attempts,
             unique_retry_fingerprints=unique_fingerprints,
         )
+        short_circuit_retry, retry_quality_reason = (
+            self._should_short_circuit_same_base_retry(
+                state,
+                base_token_index=base_token_index,
+                fingerprint_attempts=fingerprint_attempts,
+                unique_fingerprints=unique_fingerprints,
+            )
+        )
+        if short_circuit_retry:
+            state.low_value_retry_suppressed_count += 1
+            state.same_base_retry_short_circuit_count += 1
+            state.last_retry_quality_reason = retry_quality_reason
+            state.last_retry_decision_reason = retry_quality_reason
+            self._log_dasd_state_event(
+                "retry_quality_suppressed",
+                state,
+                decision_reason=retry_quality_reason,
+                base_token_index=base_token_index,
+                fingerprint_attempts=fingerprint_attempts,
+                unique_retry_fingerprints=unique_fingerprints,
+            )
+            return False, "low_value_retry_suppressed"
 
         send_ts = time.perf_counter()
         task = asyncio.create_task(
@@ -2125,6 +2430,14 @@ class SpecExecClient:
         state.next_bundle_id += 1
         state.next_base_index += state.window_size
         state.cleanup_induced_drain = False
+        if state.local_stabilization_active:
+            self._log_dasd_state_event(
+                "local_stabilization_retry",
+                state,
+                decision_reason=phase,
+                base_token_index=base_token_index,
+                fingerprint_attempts=fingerprint_attempts,
+            )
         if config.dasd_debug:
             self._logger.info(
                 "[DASD] send req=%s bundle=%d epoch=%d base=%d base_retry=%d W=%d inflight=%d credit=%s tree_depth=%s leaf_budget=%s branch_width=%s tokens=%s",
@@ -2384,6 +2697,12 @@ class SpecExecClient:
             )
             forced_commit_applied = False
             if accepted_len > 0:
+                self._exit_local_stabilization(
+                    state,
+                    reason="committed_progress",
+                    success=True,
+                )
+                self._record_cooldown_progress(state, reason="committed_progress")
                 self._exit_recovery_mode(state, reason="committed_progress")
                 state.cleanup_induced_drain = False
             elif (
@@ -2400,6 +2719,15 @@ class SpecExecClient:
                     if state.consecutive_full_rejections
                     >= config.dasd_recovery_full_rejection_threshold
                     else "same_base_retry"
+                )
+                self._enter_local_stabilization(state, reason=trigger_reason)
+                state.rollback_cleanup_deferred_count += 1
+                state.last_mitigation_decision_reason = trigger_reason
+                self._log_dasd_state_event(
+                    "rollback_cleanup_deferred",
+                    state,
+                    decision_reason=trigger_reason,
+                    base_token_index=prev_committed,
                 )
                 self._enter_recovery_mode(state, reason=trigger_reason)
                 self._record_rollback_cause(
@@ -2577,23 +2905,73 @@ class SpecExecClient:
                 )
                 state.rollback_blocked_committed_len = state.committed_len
                 state.rollback_blocked_token_id = failed_first_token
+                defer_rollback_cleanup = self._should_defer_rollback_cleanup(
+                    state,
+                    base_token_index=prev_committed,
+                    rollback_cause=rollback_cause,
+                )
                 state.epoch += 1
 
                 cancelled_task_infos = self._cancel_dasd_inflight(
-                    state, reason="rollback_cleanup"
+                    state,
+                    reason=(
+                        "post_rejection_suffix_refresh"
+                        if defer_rollback_cleanup
+                        else "rollback_cleanup"
+                    ),
                 )
                 if cancelled_task_infos:
                     drain_task = asyncio.create_task(
                         self._await_cancelled_dasd_tasks(
                             state,
                             cancelled_task_infos,
-                            reason="rollback_cleanup",
+                            reason=(
+                                "post_rejection_suffix_refresh"
+                                if defer_rollback_cleanup
+                                else "rollback_cleanup"
+                            ),
                         )
                     )
                     drain_task.add_done_callback(lambda _: None)
 
+                if defer_rollback_cleanup:
+                    if not state.local_stabilization_active:
+                        self._enter_local_stabilization(state, reason=rollback_cause)
+                    state.last_mitigation_decision_reason = rollback_cause
+                    self._log_dasd_state_event(
+                        "mitigation_decision",
+                        state,
+                        decision_reason=rollback_cause,
+                        base_token_index=prev_committed,
+                    )
+                    refreshed, refresh_reason = self._perform_suffix_refresh(
+                        state,
+                        reason=rollback_cause,
+                    )
+                    if refreshed:
+                        self._log_dasd_state_event(
+                            "recovery_resume_success",
+                            state,
+                            decision_reason=rollback_cause,
+                            base_token_index=prev_committed,
+                        )
+                        return
+                    state.rollback_cleanup_escalated_count += 1
+                    self._log_dasd_state_event(
+                        "rollback_cleanup_escalated",
+                        state,
+                        decision_reason=refresh_reason,
+                        base_token_index=prev_committed,
+                    )
+
+                state.expensive_recovery_count += 1
                 self._prepare_dasd_refill_from_committed(
                     state, reason="rollback_cleanup"
+                )
+                self._exit_local_stabilization(
+                    state,
+                    reason="rollback_cleanup_escalated",
+                    success=False,
                 )
                 if config.dasd_debug:
                     committed_prefix_tail = state.drafted_tokens[

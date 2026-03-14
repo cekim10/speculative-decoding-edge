@@ -261,6 +261,26 @@ class DasdRequestState:
     forced_commit_failure_count: int = 0
     failure_cache_block_decision_count: int = 0
     failure_cache_blocked_same_base_retry_count: int = 0
+    local_stabilization_active: bool = False
+    local_stabilization_attempt_count: int = 0
+    local_stabilization_success_count: int = 0
+    local_stabilization_fail_count: int = 0
+    suffix_refresh_attempt_count: int = 0
+    suffix_refresh_success_count: int = 0
+    suffix_refresh_fail_count: int = 0
+    rollback_cleanup_deferred_count: int = 0
+    rollback_cleanup_escalated_count: int = 0
+    rollback_cleanup_avoided_count: int = 0
+    cooldown_active: bool = False
+    cooldown_entry_count: int = 0
+    cooldown_exit_count: int = 0
+    cooldown_progress_count: int = 0
+    cooldown_progress_remaining: int = 0
+    unstable_phase_inflight_cap_hits: int = 0
+    low_value_retry_suppressed_count: int = 0
+    same_base_retry_short_circuit_count: int = 0
+    cheap_recovery_success_count: int = 0
+    expensive_recovery_count: int = 0
     sum_window_at_send: int = 0
     sum_tree_depth_at_send: int = 0
     sum_leaf_budget_at_send: int = 0
@@ -272,6 +292,10 @@ class DasdRequestState:
     last_retry_decision_reason: str = ""
     last_recovery_mode_transition_reason: str = ""
     last_forced_commit_decision_reason: str = ""
+    last_mitigation_decision_reason: str = ""
+    last_suffix_refresh_reason: str = ""
+    last_cooldown_reason: str = ""
+    last_retry_quality_reason: str = ""
     cleanup_reason: str = ""
     cleanup_induced_drain: bool = False
     base_retry_counts: dict[int, int] = field(default_factory=dict)

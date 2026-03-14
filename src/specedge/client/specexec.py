@@ -567,9 +567,10 @@ class SpecExecClient:
             and not self._dasd_eos_seen(state)
         )
 
+    def _clear_suffix_refresh_anchor(self, state: DasdRequestState):
+        state.suffix_refresh_anchor_committed_len = None
+
     def _prepare_dasd_refill_from_committed(self, state: DasdRequestState, reason: str):
-        if reason != "suffix_refresh":
-            state.suffix_refresh_anchor = None
         before_next_base = state.next_base_index
         before_drafted_len = len(state.drafted_tokens)
         before_pending_responses = len(state.responses_by_base)
@@ -639,11 +640,32 @@ class SpecExecClient:
             )
 
     def _prepare_dasd_suffix_refresh_state(self, state: DasdRequestState, reason: str):
-        anchor = (state.epoch, state.committed_len)
-        if state.suffix_refresh_anchor != anchor:
+        anchor_committed_len = state.committed_len
+        if state.suffix_refresh_anchor_committed_len != anchor_committed_len:
+            self._log_dasd_state_event(
+                "suffix_refresh_anchor_miss",
+                state,
+                decision_reason=reason,
+                base_token_index=state.committed_len,
+                anchor_committed_len=state.suffix_refresh_anchor_committed_len,
+                current_committed_len=state.committed_len,
+                current_epoch=state.epoch,
+                truncating_rebuild_applied=True,
+            )
             self._prepare_dasd_refill_from_committed(state, reason="suffix_refresh")
-            state.suffix_refresh_anchor = anchor
+            state.suffix_refresh_anchor_committed_len = anchor_committed_len
             return
+
+        self._log_dasd_state_event(
+            "suffix_refresh_anchor_hit",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            anchor_committed_len=state.suffix_refresh_anchor_committed_len,
+            current_committed_len=state.committed_len,
+            current_epoch=state.epoch,
+            truncating_rebuild_applied=False,
+        )
 
         before_next_base = state.next_base_index
         before_pending_responses = len(state.responses_by_base)
@@ -1960,7 +1982,7 @@ class SpecExecClient:
         state.drafted_tokens.append(token_id)
         state.committed_len += 1
         state.next_base_index = state.committed_len
-        state.suffix_refresh_anchor = None
+        self._clear_suffix_refresh_anchor(state)
         state.consecutive_full_rejections = 0
         state.rollback_blocked_committed_len = None
         state.rollback_blocked_token_id = None
@@ -2123,7 +2145,7 @@ class SpecExecClient:
         state.drafted_tokens.append(token_id)
         state.committed_len += 1
         state.next_base_index = state.committed_len
-        state.suffix_refresh_anchor = None
+        self._clear_suffix_refresh_anchor(state)
         state.consecutive_full_rejections = 0
         state.rollback_blocked_committed_len = None
         state.rollback_blocked_token_id = None
@@ -2690,7 +2712,7 @@ class SpecExecClient:
             state.total_accepted_tokens += accepted_len
             state.committed_len += accepted_len
             if accepted_len > 0:
-                state.suffix_refresh_anchor = None
+                self._clear_suffix_refresh_anchor(state)
             assert state.committed_len >= prev_committed
             lifecycle = self._ensure_base_lifecycle(state, prev_committed)
             lifecycle["accepted_tokens_accumulated"] += accepted_len
@@ -2999,6 +3021,7 @@ class SpecExecClient:
                     )
 
                 state.expensive_recovery_count += 1
+                self._clear_suffix_refresh_anchor(state)
                 self._prepare_dasd_refill_from_committed(
                     state, reason="rollback_cleanup"
                 )
@@ -3033,6 +3056,7 @@ class SpecExecClient:
     async def _drain_dasd_inflight(self, state: DasdRequestState):
         if not state.inflight:
             return
+        self._clear_suffix_refresh_anchor(state)
         task_infos = self._cancel_dasd_inflight(state, reason="request_finish_cleanup")
         await self._await_cancelled_dasd_tasks(
             state,
@@ -3044,6 +3068,7 @@ class SpecExecClient:
         if state.aborted and not state.inflight:
             return
         state.aborted = True
+        self._clear_suffix_refresh_anchor(state)
         if state.abort_reason == "":
             state.abort_reason = reason
         self._logger.warning(

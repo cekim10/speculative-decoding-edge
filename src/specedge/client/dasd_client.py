@@ -338,6 +338,13 @@ class DasdRequestState:
     frontier_local_tiny_rebuild_root_child_inspected_count: int = 0
     frontier_local_tiny_rebuild_root_child_last_signature: tuple[int, ...] | None = None
     frontier_local_tiny_rebuild_root_child_last_reason: str = ""
+    frontier_local_tiny_rebuild_root_step_mask_count: int = 0
+    frontier_local_tiny_rebuild_root_step_mask_success_count: int = 0
+    frontier_local_tiny_rebuild_root_step_mask_fail_count: int = 0
+    frontier_local_tiny_rebuild_root_step_mask_blocked_token_total: int = 0
+    frontier_local_tiny_rebuild_root_step_mask_filtered_candidate_count: int = 0
+    frontier_local_tiny_rebuild_root_step_mask_all_blocked_fail_count: int = 0
+    frontier_local_tiny_rebuild_root_step_mask_last_reason: str = ""
     cooldown_active: bool = False
     cooldown_entry_count: int = 0
     cooldown_exit_count: int = 0

@@ -88,6 +88,12 @@ class SpecExecClient:
         )
         self._validator = GrpcClientController(host=config.host, device=self._device)
         self._effective_vocab_size = self._resolve_effective_vocab_size()
+        self._tiny_rebuild_root_step_blocked_tokens_active = False
+        self._tiny_rebuild_root_step_blocked_tokens: set[int] = set()
+        self._tiny_rebuild_root_step_mask_consumed = False
+        self._tiny_rebuild_root_step_mask_state: Optional[DasdRequestState] = None
+        self._tiny_rebuild_root_step_mask_filtered_candidates = 0
+        self._tiny_rebuild_root_step_mask_all_blocked = False
 
         self._proactive_client: Optional[SpecExecProactiveDraft] = None
         if self._proactive_type != "disabled" and not self._dasd_enabled:
@@ -935,6 +941,41 @@ class SpecExecClient:
         state.frontier_local_tiny_rebuild_last_distinct_signature = None
         state.frontier_local_tiny_rebuild_root_child_last_signature = None
         state.frontier_local_tiny_rebuild_root_child_last_reason = reason
+        state.frontier_local_tiny_rebuild_root_step_mask_last_reason = reason
+
+    def _activate_tiny_rebuild_root_step_mask(
+        self,
+        state: DasdRequestState,
+        blocked_tokens: set[int],
+    ):
+        self._tiny_rebuild_root_step_blocked_tokens_active = bool(blocked_tokens)
+        self._tiny_rebuild_root_step_blocked_tokens = set(blocked_tokens)
+        self._tiny_rebuild_root_step_mask_consumed = False
+        self._tiny_rebuild_root_step_mask_state = state
+        self._tiny_rebuild_root_step_mask_filtered_candidates = 0
+        self._tiny_rebuild_root_step_mask_all_blocked = False
+        if not blocked_tokens:
+            return
+        state.frontier_local_tiny_rebuild_root_step_mask_count += 1
+        state.frontier_local_tiny_rebuild_root_step_mask_blocked_token_total += len(
+            blocked_tokens
+        )
+        state.frontier_local_tiny_rebuild_root_step_mask_last_reason = "begin"
+        self._log_dasd_state_event(
+            "frontier_local_tiny_rebuild_root_step_mask_begin",
+            state,
+            decision_reason="begin",
+            base_token_index=state.committed_len,
+            blocked_tokens=sorted(blocked_tokens),
+        )
+
+    def _clear_tiny_rebuild_root_step_mask(self):
+        self._tiny_rebuild_root_step_blocked_tokens_active = False
+        self._tiny_rebuild_root_step_blocked_tokens = set()
+        self._tiny_rebuild_root_step_mask_consumed = False
+        self._tiny_rebuild_root_step_mask_state = None
+        self._tiny_rebuild_root_step_mask_filtered_candidates = 0
+        self._tiny_rebuild_root_step_mask_all_blocked = False
 
     def _get_frontier_blocked_token_id(self, state: DasdRequestState):
         base_token_index = state.committed_len
@@ -1205,6 +1246,7 @@ class SpecExecClient:
             max_n_beams=max(2, min(4, self._fixed_max_n_beams)),
             max_branch_width=max(2, min(6, self._fixed_max_branch_width)),
         )
+        self._activate_tiny_rebuild_root_step_mask(state, blocked_tokens)
         try:
             self._reset_tree_from_dasd_state(state, use_full_drafted=False)
             with self._dasd_tree_budget_context(state):
@@ -1218,10 +1260,53 @@ class SpecExecClient:
                     max_ranked_candidates_to_inspect=max_ranked_candidates_to_inspect,
                 )
             )
+            root_step_mask_filtered = self._tiny_rebuild_root_step_mask_filtered_candidates
+            root_step_mask_all_blocked = self._tiny_rebuild_root_step_mask_all_blocked
         finally:
             state.tree_budget = original_tree_budget
+            self._clear_tiny_rebuild_root_step_mask()
 
         state.frontier_local_tiny_rebuild_inspected_count += inspected
+        state.frontier_local_tiny_rebuild_root_step_mask_filtered_candidate_count += (
+            root_step_mask_filtered
+        )
+        if blocked_tokens:
+            if root_step_mask_all_blocked:
+                state.frontier_local_tiny_rebuild_root_step_mask_fail_count += 1
+                state.frontier_local_tiny_rebuild_root_step_mask_all_blocked_fail_count += 1
+                state.frontier_local_tiny_rebuild_root_step_mask_last_reason = (
+                    "tiny_rebuild_root_step_all_blocked"
+                )
+                self._log_dasd_state_event(
+                    "frontier_local_tiny_rebuild_root_step_mask_end",
+                    state,
+                    decision_reason="tiny_rebuild_root_step_all_blocked",
+                    base_token_index=base_token_index,
+                    blocked_tokens=sorted(blocked_tokens),
+                    filtered_root_step_candidates=root_step_mask_filtered,
+                    unblocked_root_step_candidates=0,
+                )
+            else:
+                if root_step_mask_filtered > 0:
+                    state.frontier_local_tiny_rebuild_root_step_mask_success_count += 1
+                    state.frontier_local_tiny_rebuild_root_step_mask_last_reason = (
+                        "mask_applied"
+                    )
+                    decision_reason = "mask_applied"
+                else:
+                    state.frontier_local_tiny_rebuild_root_step_mask_last_reason = (
+                        "mask_not_needed"
+                    )
+                    decision_reason = "mask_not_needed"
+                self._log_dasd_state_event(
+                    "frontier_local_tiny_rebuild_root_step_mask_end",
+                    state,
+                    decision_reason=decision_reason,
+                    base_token_index=base_token_index,
+                    blocked_tokens=sorted(blocked_tokens),
+                    filtered_root_step_candidates=root_step_mask_filtered,
+                    unblocked_root_step_candidates=len(root_child_signature),
+                )
         if (
             state.frontier_local_tiny_rebuild_last_committed_len == state.committed_len
             and state.frontier_local_tiny_rebuild_last_blocked_token_id == blocked_token_id
@@ -2786,6 +2871,13 @@ class SpecExecClient:
                 "frontier_local_tiny_rebuild_root_child_inspected_count": state.frontier_local_tiny_rebuild_root_child_inspected_count,
                 "frontier_local_tiny_rebuild_root_child_last_signature": state.frontier_local_tiny_rebuild_root_child_last_signature,
                 "frontier_local_tiny_rebuild_root_child_last_reason": state.frontier_local_tiny_rebuild_root_child_last_reason,
+                "frontier_local_tiny_rebuild_root_step_mask_count": state.frontier_local_tiny_rebuild_root_step_mask_count,
+                "frontier_local_tiny_rebuild_root_step_mask_success_count": state.frontier_local_tiny_rebuild_root_step_mask_success_count,
+                "frontier_local_tiny_rebuild_root_step_mask_fail_count": state.frontier_local_tiny_rebuild_root_step_mask_fail_count,
+                "frontier_local_tiny_rebuild_root_step_mask_blocked_token_total": state.frontier_local_tiny_rebuild_root_step_mask_blocked_token_total,
+                "frontier_local_tiny_rebuild_root_step_mask_filtered_candidate_count": state.frontier_local_tiny_rebuild_root_step_mask_filtered_candidate_count,
+                "frontier_local_tiny_rebuild_root_step_mask_all_blocked_fail_count": state.frontier_local_tiny_rebuild_root_step_mask_all_blocked_fail_count,
+                "frontier_local_tiny_rebuild_root_step_mask_last_reason": state.frontier_local_tiny_rebuild_root_step_mask_last_reason,
                 "cooldown_active": state.cooldown_active,
                 "cooldown_entry_count": state.cooldown_entry_count,
                 "cooldown_exit_count": state.cooldown_exit_count,
@@ -5203,6 +5295,69 @@ class SpecExecClient:
             beam_scores.unsqueeze(-1) + DECAY_FACTOR + leaves_probs
         ).flatten()
         flat_incoming_ids = leaves_ids.flatten()
+        flat_candidate_indices = torch.arange(
+            flat_incoming_probs.size(0), device=logits.device
+        )
+
+        if (
+            self._tiny_rebuild_root_step_blocked_tokens_active
+            and not self._tiny_rebuild_root_step_mask_consumed
+            and flat_incoming_ids.numel() > 0
+        ):
+            # Keep blocked-token lookup non-global: tiny rebuild only masks the
+            # first speculative token so structured DASD logging does not alter
+            # healthy-path tree growth semantics.
+            root_parent_position = self._tree.prefix_len - 1
+            flat_parent_positions = beam_positions.unsqueeze(-1).expand_as(leaves_ids).flatten()
+            root_step_mask = flat_parent_positions == root_parent_position
+            filtered_count = 0
+            if root_step_mask.any():
+                blocked_ids = torch.tensor(
+                    sorted(self._tiny_rebuild_root_step_blocked_tokens),
+                    dtype=flat_incoming_ids.dtype,
+                    device=flat_incoming_ids.device,
+                )
+                blocked_token_mask = torch.isin(flat_incoming_ids, blocked_ids)
+                root_step_blocked_mask = root_step_mask & blocked_token_mask
+                filtered_count = int(root_step_blocked_mask.sum().item())
+                if filtered_count > 0:
+                    keep_mask = ~root_step_blocked_mask
+                    flat_incoming_probs = flat_incoming_probs[keep_mask]
+                    flat_incoming_ids = flat_incoming_ids[keep_mask]
+                    flat_candidate_indices = flat_candidate_indices[keep_mask]
+                remaining_root_step = int((root_step_mask & ~root_step_blocked_mask).sum().item())
+                self._tiny_rebuild_root_step_mask_filtered_candidates += filtered_count
+                self._tiny_rebuild_root_step_mask_all_blocked = remaining_root_step == 0
+                if self._tiny_rebuild_root_step_mask_state is not None:
+                    event_name = (
+                        "frontier_local_tiny_rebuild_root_step_mask_all_blocked"
+                        if self._tiny_rebuild_root_step_mask_all_blocked
+                        else "frontier_local_tiny_rebuild_root_step_mask_applied"
+                    )
+                    reason = (
+                        "tiny_rebuild_root_step_all_blocked"
+                        if self._tiny_rebuild_root_step_mask_all_blocked
+                        else "tiny_rebuild_root_step_mask_applied"
+                    )
+                    self._log_dasd_state_event(
+                        event_name,
+                        self._tiny_rebuild_root_step_mask_state,
+                        decision_reason=reason,
+                        base_token_index=self._tiny_rebuild_root_step_mask_state.committed_len,
+                        blocked_tokens=sorted(
+                            self._tiny_rebuild_root_step_blocked_tokens
+                        ),
+                        filtered_root_step_candidates=filtered_count,
+                        unblocked_root_step_candidates=remaining_root_step,
+                    )
+            self._tiny_rebuild_root_step_mask_consumed = True
+            if flat_incoming_probs.numel() == 0:
+                return (
+                    flat_incoming_ids,
+                    torch.empty(0, dtype=beam_positions.dtype, device=beam_positions.device),
+                    torch.empty(0, dtype=beam_indices.dtype, device=beam_indices.device),
+                    flat_incoming_probs,
+                )
 
         joint_probs = torch.concat(
             [
@@ -5222,17 +5377,15 @@ class SpecExecClient:
 
             flat_best_mask = torch.where(flat_incoming_probs >= min_joint_prob)[0]
             flat_best_probs = flat_incoming_probs[flat_best_mask]
-            flat_best_indices = flat_best_mask
-            best_children_token_ids = flat_incoming_ids[flat_best_indices]
+            flat_best_indices = flat_candidate_indices[flat_best_mask]
+            best_children_token_ids = flat_incoming_ids[flat_best_mask]
 
             if flat_best_indices.size(-1) + self._tree.end > self._max_len:
                 raise NotImplementedError("Implement trim budget")
 
         else:
             flat_best_probs = flat_incoming_probs
-            flat_best_indices = torch.arange(
-                flat_incoming_probs.size(0), device=logits.device
-            )
+            flat_best_indices = flat_candidate_indices
             best_children_token_ids = flat_incoming_ids
 
         best_hypo_ids = flat_best_indices // self._max_branch_width

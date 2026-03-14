@@ -929,6 +929,10 @@ class SpecExecClient:
         state.alternative_frontier_distinct_first_token_target = 0
         state.alternative_frontier_distinct_first_token_last_seen = None
         state.alternative_frontier_last_distinct_reason = reason
+        state.frontier_local_tiny_rebuild_last_reason = reason
+        state.frontier_local_tiny_rebuild_last_committed_len = None
+        state.frontier_local_tiny_rebuild_last_blocked_token_id = None
+        state.frontier_local_tiny_rebuild_last_distinct_signature = None
 
     def _get_frontier_blocked_token_id(self, state: DasdRequestState):
         base_token_index = state.committed_len
@@ -1168,6 +1172,151 @@ class SpecExecClient:
                 state.alternative_frontier_blocked_first_token_count += 1
                 state.alternative_frontier_distinct_first_token_blocked_reject_count += 1
         return None, "frontier_token_blocked_no_alternative"
+
+    def _search_frontier_local_tiny_rebuild_candidate(
+        self,
+        state: DasdRequestState,
+        reason: str,
+    ):
+        base_token_index = state.committed_len
+        blocked_token_id = self._get_frontier_blocked_token_id(state)
+        blocked_tokens = self._compute_blocked_tokens_for_prefix(state)
+        target_distinct_first_tokens = min(3, max(1, state.window_size))
+        max_ranked_candidates_to_inspect = 8
+        state.frontier_local_tiny_rebuild_count += 1
+        state.frontier_local_tiny_rebuild_last_reason = reason
+        self._log_dasd_state_event(
+            "frontier_local_tiny_rebuild_begin",
+            state,
+            decision_reason=reason,
+            base_token_index=base_token_index,
+            blocked_tokens=sorted(blocked_tokens),
+            blocked_token=blocked_token_id,
+            target_distinct_first_tokens=target_distinct_first_tokens,
+            max_ranked_candidates_to_inspect=max_ranked_candidates_to_inspect,
+        )
+
+        original_tree_budget = state.tree_budget
+        state.tree_budget = DasdTreeBudget(
+            max_beam_len=max(1, min(2, self._fixed_max_beam_len)),
+            max_budget=max(2, min(8, self._fixed_max_budget)),
+            max_n_beams=max(2, min(4, self._fixed_max_n_beams)),
+            max_branch_width=max(2, min(6, self._fixed_max_branch_width)),
+        )
+        try:
+            self._reset_tree_from_dasd_state(state, use_full_drafted=False)
+            with self._dasd_tree_budget_context(state):
+                self._grow_tree(prefill=True)
+            self._log_dasd_leaf_candidates(state)
+            candidates, inspected = self._extract_distinct_first_token_candidates_for_dasd(
+                state,
+                blocked_tokens=blocked_tokens,
+                target_distinct_first_tokens=target_distinct_first_tokens,
+                max_ranked_candidates_to_inspect=max_ranked_candidates_to_inspect,
+            )
+        finally:
+            state.tree_budget = original_tree_budget
+
+        state.frontier_local_tiny_rebuild_inspected_count += inspected
+        distinct_signature = tuple(int(candidate[0]) for candidate in candidates if candidate)
+        if (
+            state.frontier_local_tiny_rebuild_last_committed_len == state.committed_len
+            and state.frontier_local_tiny_rebuild_last_blocked_token_id == blocked_token_id
+            and state.frontier_local_tiny_rebuild_last_distinct_signature
+            == distinct_signature
+        ):
+            state.frontier_local_tiny_rebuild_fail_count += 1
+            state.frontier_local_tiny_rebuild_repeated_signature_fail_count += 1
+            state.frontier_local_tiny_rebuild_last_reason = (
+                "frontier_token_blocked_tiny_rebuild_no_alternative"
+            )
+            self._log_dasd_state_event(
+                "frontier_local_tiny_rebuild_fail",
+                state,
+                decision_reason="repeated_tiny_rebuild_signature",
+                base_token_index=base_token_index,
+                blocked_tokens=sorted(blocked_tokens),
+                distinct_first_tokens_considered=distinct_signature,
+                distinct_pool_size=len(candidates),
+                inspected_candidates=inspected,
+            )
+            return False, "frontier_token_blocked_tiny_rebuild_no_alternative"
+
+        state.frontier_local_tiny_rebuild_last_committed_len = state.committed_len
+        state.frontier_local_tiny_rebuild_last_blocked_token_id = blocked_token_id
+        state.frontier_local_tiny_rebuild_last_distinct_signature = distinct_signature
+
+        chosen_candidate = None
+        choose_reason = "frontier_token_blocked_tiny_rebuild_no_alternative"
+        for rank_index, candidate in enumerate(candidates):
+            sendable, candidate_reason = self._is_candidate_first_token_sendable(
+                state,
+                base_token_index,
+                candidate,
+            )
+            if sendable:
+                chosen_candidate = candidate
+                self._log_dasd_state_event(
+                    "frontier_local_tiny_rebuild_candidate",
+                    state,
+                    decision_reason="sendable_candidate",
+                    base_token_index=base_token_index,
+                    candidate_first_token=int(candidate[0]),
+                    candidate_len=len(candidate),
+                    rank_index=rank_index,
+                )
+                break
+            state.frontier_local_tiny_rebuild_candidate_reject_count += 1
+            if candidate_reason == "candidate_first_token_blocked":
+                state.frontier_local_tiny_rebuild_blocked_reject_count += 1
+            self._log_dasd_state_event(
+                "frontier_local_tiny_rebuild_candidate_rejected",
+                state,
+                decision_reason=candidate_reason,
+                base_token_index=base_token_index,
+                candidate_first_token=int(candidate[0]) if candidate else None,
+                candidate_len=len(candidate),
+                rank_index=rank_index,
+            )
+            choose_reason = candidate_reason
+        if chosen_candidate is not None:
+            self._install_alternative_frontier_suffix(
+                state,
+                chosen_candidate,
+                reason="frontier_local_tiny_rebuild_success",
+            )
+            state.frontier_local_tiny_rebuild_success_count += 1
+            state.frontier_local_tiny_rebuild_last_reason = (
+                "frontier_local_tiny_rebuild_success"
+            )
+            self._log_dasd_state_event(
+                "frontier_local_tiny_rebuild_success",
+                state,
+                decision_reason="frontier_local_tiny_rebuild_success",
+                base_token_index=base_token_index,
+                chosen_first_token=int(chosen_candidate[0]),
+                distinct_first_tokens_considered=distinct_signature,
+                distinct_pool_size=len(candidates),
+                inspected_candidates=inspected,
+            )
+            return True, "frontier_local_tiny_rebuild_success"
+
+        state.frontier_local_tiny_rebuild_fail_count += 1
+        state.frontier_local_tiny_rebuild_last_reason = (
+            "frontier_token_blocked_tiny_rebuild_no_alternative"
+        )
+        self._log_dasd_state_event(
+            "frontier_local_tiny_rebuild_fail",
+            state,
+            decision_reason="frontier_token_blocked_tiny_rebuild_no_alternative",
+            base_token_index=base_token_index,
+            blocked_tokens=sorted(blocked_tokens),
+            distinct_first_tokens_considered=distinct_signature,
+            distinct_pool_size=len(candidates),
+            inspected_candidates=inspected,
+            reason=choose_reason,
+        )
+        return False, "frontier_token_blocked_tiny_rebuild_no_alternative"
 
     def _extract_ranked_path_token_candidates_for_dasd(
         self,
@@ -1635,8 +1784,19 @@ class SpecExecClient:
                         self._has_sendable_novel_frontier_after_refresh(state)
                     )
                 else:
-                    sendable_after_refresh = False
-                    frontier_reason = alternative_reason
+                    tiny_found, tiny_reason = (
+                        self._search_frontier_local_tiny_rebuild_candidate(
+                            state,
+                            reason="suffix_refresh_tiny_rebuild",
+                        )
+                    )
+                    if tiny_found:
+                        sendable_after_refresh, frontier_reason = (
+                            self._has_sendable_novel_frontier_after_refresh(state)
+                        )
+                    else:
+                        sendable_after_refresh = False
+                        frontier_reason = tiny_reason or alternative_reason
             if not sendable_after_refresh:
                 state.suffix_refresh_fail_count += 1
                 self._log_dasd_state_event(
@@ -1814,6 +1974,7 @@ class SpecExecClient:
                 and refill_result.get("reason") in {
                     "frontier_token_blocked",
                     "frontier_token_blocked_no_alternative",
+                    "frontier_token_blocked_tiny_rebuild_no_alternative",
                 }
             ):
                 alternative_found, alternative_reason = (
@@ -1829,7 +1990,22 @@ class SpecExecClient:
                         allow_regeneration=False,
                     )
                 else:
-                    state.last_recovery_failure_reason = alternative_reason
+                    tiny_found, tiny_reason = (
+                        self._search_frontier_local_tiny_rebuild_candidate(
+                            state,
+                            reason="rebuild_recovery_tiny_rebuild",
+                        )
+                    )
+                    if tiny_found:
+                        refill_result = await self._fill_inflight_for_dasd(
+                            state,
+                            phase=reason,
+                            allow_regeneration=False,
+                        )
+                    else:
+                        state.last_recovery_failure_reason = (
+                            tiny_reason or alternative_reason
+                        )
             if state.inflight:
                 state.refill_success_count += 1
                 state.recovery_resume_success_count += 1
@@ -2366,6 +2542,14 @@ class SpecExecClient:
                 "alternative_frontier_distinct_first_token_blocked_reject_count": state.alternative_frontier_distinct_first_token_blocked_reject_count,
                 "alternative_frontier_distinct_first_token_inspected_count": state.alternative_frontier_distinct_first_token_inspected_count,
                 "alternative_frontier_last_distinct_reason": state.alternative_frontier_last_distinct_reason,
+                "frontier_local_tiny_rebuild_count": state.frontier_local_tiny_rebuild_count,
+                "frontier_local_tiny_rebuild_success_count": state.frontier_local_tiny_rebuild_success_count,
+                "frontier_local_tiny_rebuild_fail_count": state.frontier_local_tiny_rebuild_fail_count,
+                "frontier_local_tiny_rebuild_candidate_reject_count": state.frontier_local_tiny_rebuild_candidate_reject_count,
+                "frontier_local_tiny_rebuild_blocked_reject_count": state.frontier_local_tiny_rebuild_blocked_reject_count,
+                "frontier_local_tiny_rebuild_inspected_count": state.frontier_local_tiny_rebuild_inspected_count,
+                "frontier_local_tiny_rebuild_repeated_signature_fail_count": state.frontier_local_tiny_rebuild_repeated_signature_fail_count,
+                "frontier_local_tiny_rebuild_last_reason": state.frontier_local_tiny_rebuild_last_reason,
                 "cooldown_active": state.cooldown_active,
                 "cooldown_entry_count": state.cooldown_entry_count,
                 "cooldown_exit_count": state.cooldown_exit_count,
@@ -3410,6 +3594,15 @@ class SpecExecClient:
                     )
                     last_reason = alternative_reason
                     if alternative_found:
+                        continue
+                    tiny_found, tiny_reason = (
+                        self._search_frontier_local_tiny_rebuild_candidate(
+                            state,
+                            reason=f"{phase}_frontier_token_blocked_tiny_rebuild",
+                        )
+                    )
+                    last_reason = tiny_reason or alternative_reason
+                    if tiny_found:
                         continue
                     self._log_refill_decision(
                         state,

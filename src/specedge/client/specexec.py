@@ -266,6 +266,179 @@ class SpecExecClient:
             " ".join(f"{key}={value}" for key, value in extra.items()),
         )
 
+    def _log_dasd_state_event(
+        self,
+        event: str,
+        state: DasdRequestState,
+        decision_reason: str,
+        **extra,
+    ):
+        if not config.dasd_debug:
+            return
+        self._logger.info(
+            "[DASD] %s req=%s epoch=%d base_token_index=%d committed_len=%d drafted_len=%d next_base_index=%d inflight_count=%d pending_response_count=%d active_task_count=%d W=%d tree_depth=%s leaf_budget=%s credit=%s full_rejection_streak=%d same_base_retry_count=%d recovery_mode_active=%s forced_commit_eligible=%s forced_commit_applied=%s verifier_next_token_id=%s reject_reason=%s blocked_tokens=%s decision_reason=%s %s",
+            event,
+            state.request_id,
+            state.epoch,
+            state.committed_len,
+            state.committed_len,
+            len(state.drafted_tokens),
+            state.next_base_index,
+            len(state.inflight),
+            len(state.responses_by_base),
+            len(state.task_to_bundle),
+            state.window_size,
+            state.tree_budget.max_beam_len if state.tree_budget is not None else None,
+            state.tree_budget.max_budget if state.tree_budget is not None else None,
+            state.credit_controller.credit if state.credit_controller is not None else None,
+            state.consecutive_full_rejections,
+            state.same_base_retry_count,
+            state.recovery_mode_active,
+            extra.pop("forced_commit_eligible", None),
+            extra.pop("forced_commit_applied", None),
+            extra.pop("verifier_next_token_id", None),
+            extra.pop("reject_reason", None),
+            sorted(self._blocked_tokens_for_prefix(state)),
+            decision_reason,
+            " ".join(f"{key}={value}" for key, value in extra.items()),
+        )
+
+    def _ensure_base_lifecycle(self, state: DasdRequestState, base_token_index: int):
+        lifecycle = state.base_lifecycle.get(base_token_index)
+        if lifecycle is None:
+            lifecycle = {
+                "first_epoch_seen": state.epoch,
+                "last_epoch_seen": state.epoch,
+                "send_attempts": 0,
+                "accepted_tokens_accumulated": 0,
+                "full_rejections": 0,
+                "forced_commit_attempts": 0,
+                "forced_commit_successes": 0,
+                "recovery_mode_attempts": 0,
+                "rollback_events": 0,
+                "unique_retry_fingerprints": set(),
+                "retry_fingerprints": {},
+                "progressed": False,
+                "abandoned": False,
+                "same_base_retry_events": 0,
+            }
+            state.base_lifecycle[base_token_index] = lifecycle
+        lifecycle["last_epoch_seen"] = state.epoch
+        return lifecycle
+
+    def _retry_fingerprint(
+        self,
+        state: DasdRequestState,
+        base_token_index: int,
+        token_ids: list[int],
+    ):
+        return (
+            base_token_index,
+            state.window_size,
+            state.tree_budget.max_beam_len if state.tree_budget is not None else None,
+            state.tree_budget.max_budget if state.tree_budget is not None else None,
+            tuple(token_ids[: min(len(token_ids), 8)]),
+            len(token_ids),
+        )
+
+    def _maybe_emit_base_lifecycle_summary(
+        self,
+        state: DasdRequestState,
+        base_token_index: Optional[int],
+        final: bool = False,
+        reason: str = "",
+    ):
+        if base_token_index is None:
+            return
+        lifecycle = state.base_lifecycle.get(base_token_index)
+        if lifecycle is None:
+            return
+        unique_retry_fingerprints = len(lifecycle["unique_retry_fingerprints"])
+        self._log_dasd_state_event(
+            "base_lifecycle_summary",
+            state,
+            decision_reason=reason or ("request_end" if final else "base_transition"),
+            base_token_index=base_token_index,
+            first_epoch_seen=lifecycle["first_epoch_seen"],
+            last_epoch_seen=lifecycle["last_epoch_seen"],
+            send_attempts=lifecycle["send_attempts"],
+            accepted_tokens_accumulated=lifecycle["accepted_tokens_accumulated"],
+            full_rejections=lifecycle["full_rejections"],
+            forced_commit_attempts=lifecycle["forced_commit_attempts"],
+            forced_commit_successes=lifecycle["forced_commit_successes"],
+            recovery_mode_attempts=lifecycle["recovery_mode_attempts"],
+            rollback_events=lifecycle["rollback_events"],
+            unique_retry_fingerprints=unique_retry_fingerprints,
+            progressed=lifecycle["progressed"],
+            abandoned=lifecycle["abandoned"],
+        )
+
+    def _record_retry_fingerprint(
+        self,
+        state: DasdRequestState,
+        base_token_index: int,
+        token_ids: list[int],
+    ):
+        lifecycle = self._ensure_base_lifecycle(state, base_token_index)
+        fingerprint = self._retry_fingerprint(state, base_token_index, token_ids)
+        fingerprints = state.retry_fingerprints_by_base.setdefault(base_token_index, {})
+        fingerprints[fingerprint] = fingerprints.get(fingerprint, 0) + 1
+        lifecycle["retry_fingerprints"][fingerprint] = fingerprints[fingerprint]
+        lifecycle["unique_retry_fingerprints"].add(fingerprint)
+        if fingerprints[fingerprint] == 1:
+            state.unique_retry_fingerprint_count += 1
+        else:
+            state.duplicate_retry_fingerprint_count += 1
+        if (
+            fingerprints[fingerprint] >= 2
+            and lifecycle["accepted_tokens_accumulated"] == 0
+        ):
+            state.retry_loop_suspected_count += 1
+            self._log_dasd_state_event(
+                "retry_loop_suspected",
+                state,
+                decision_reason="duplicate_retry_fingerprint",
+                base_token_index=base_token_index,
+                fingerprint_attempts=fingerprints[fingerprint],
+                unique_retry_fingerprints=len(lifecycle["unique_retry_fingerprints"]),
+                failure_cache_changed=bool(self._blocked_tokens_for_prefix(state)),
+                recovery_mode_active=state.recovery_mode_active,
+            )
+            self._log_dasd_state_event(
+                "retry_loop_breaker_candidate",
+                state,
+                decision_reason=(
+                    "forced_commit_candidate"
+                    if state.recovery_mode_active
+                    else "recovery_mode_candidate"
+                ),
+                base_token_index=base_token_index,
+                fingerprint_attempts=fingerprints[fingerprint],
+                unique_retry_fingerprints=len(lifecycle["unique_retry_fingerprints"]),
+            )
+        return fingerprints[fingerprint], len(lifecycle["unique_retry_fingerprints"])
+
+    def _record_rollback_cause(
+        self,
+        state: DasdRequestState,
+        cause: str,
+        base_token_index: int,
+        **extra,
+    ):
+        state.last_rollback_cause = cause
+        count_field = f"{cause}_count"
+        if hasattr(state, count_field):
+            setattr(state, count_field, getattr(state, count_field) + 1)
+        lifecycle = self._ensure_base_lifecycle(state, base_token_index)
+        lifecycle["rollback_events"] += 1
+        self._log_dasd_state_event(
+            "rollback_decision",
+            state,
+            decision_reason=cause,
+            base_token_index=base_token_index,
+            **extra,
+        )
+
     def _can_continue_dasd_generation(self, state: DasdRequestState):
         return (
             not state.aborted
@@ -856,6 +1029,12 @@ class SpecExecClient:
         self._log_finish_condition(state, reason=finish_status)
 
         await self._drain_dasd_inflight(state)
+        self._maybe_emit_base_lifecycle_summary(
+            state,
+            state.current_base_tracking,
+            final=True,
+            reason=finish_status,
+        )
 
         final_generated = state.drafted_tokens[: state.committed_len]
         if final_generated:
@@ -925,6 +1104,34 @@ class SpecExecClient:
                 "draft_regeneration_no_suffix_count": state.draft_regeneration_no_suffix_count,
                 "recovery_resume_success_count": state.recovery_resume_success_count,
                 "recovery_resume_fail_count": state.recovery_resume_fail_count,
+                "rollback_due_to_full_rejection_threshold_count": state.rollback_due_to_full_rejection_threshold_count,
+                "rollback_due_to_same_base_retry_threshold_count": state.rollback_due_to_same_base_retry_threshold_count,
+                "rollback_due_to_failure_cache_blocked_suffix_count": state.rollback_due_to_failure_cache_blocked_suffix_count,
+                "rollback_due_to_forced_commit_failure_count": state.rollback_due_to_forced_commit_failure_count,
+                "rollback_due_to_recovery_mode_entry_count": state.rollback_due_to_recovery_mode_entry_count,
+                "rollback_due_to_post_recovery_rejection_count": state.rollback_due_to_post_recovery_rejection_count,
+                "rollback_due_to_contiguous_commit_mismatch_count": state.rollback_due_to_contiguous_commit_mismatch_count,
+                "rollback_due_to_state_inconsistency_count": state.rollback_due_to_state_inconsistency_count,
+                "rollback_due_to_retry_loop_breaker_count": state.rollback_due_to_retry_loop_breaker_count,
+                "retry_loop_suspected_count": state.retry_loop_suspected_count,
+                "duplicate_retry_fingerprint_count": state.duplicate_retry_fingerprint_count,
+                "unique_retry_fingerprint_count": state.unique_retry_fingerprint_count,
+                "per_base_max_retry_count": state.per_base_max_retry_count,
+                "per_base_max_full_rejection_count": state.per_base_max_full_rejection_count,
+                "per_base_max_same_base_retry_count": state.per_base_max_same_base_retry_count,
+                "recovery_mode_entry_count": state.recovery_mode_entry_count,
+                "recovery_mode_exit_count": state.recovery_mode_exit_count,
+                "recovery_mode_success_count": state.recovery_mode_success_count,
+                "recovery_mode_failure_count": state.recovery_mode_failure_count,
+                "forced_commit_attempt_count": state.forced_commit_attempt_count,
+                "forced_commit_success_count": state.forced_commit_success_count,
+                "forced_commit_failure_count": state.forced_commit_failure_count,
+                "failure_cache_block_decision_count": state.failure_cache_block_decision_count,
+                "failure_cache_blocked_same_base_retry_count": state.failure_cache_blocked_same_base_retry_count,
+                "last_rollback_cause": state.last_rollback_cause,
+                "last_retry_decision_reason": state.last_retry_decision_reason,
+                "last_recovery_mode_transition_reason": state.last_recovery_mode_transition_reason,
+                "last_forced_commit_decision_reason": state.last_forced_commit_decision_reason,
                 "average_W": (
                     state.sum_window_at_send / state.verify_rounds
                     if state.verify_rounds > 0
@@ -1177,6 +1384,9 @@ class SpecExecClient:
         }
         if blocked_tokens:
             state.failure_cache_hits += 1
+            state.failure_cache_block_decision_count += 1
+            if state.base_retry_counts.get(state.committed_len, 0) > 1:
+                state.failure_cache_blocked_same_base_retry_count += 1
             if config.dasd_debug:
                 self._logger.info(
                     "[DASD] failure_cache_hit req=%s epoch=%d committed=%d base=%d blocked_first_tokens=%s current_round=%d",
@@ -1187,6 +1397,14 @@ class SpecExecClient:
                     sorted(blocked_tokens),
                     state.verify_rounds,
                 )
+            self._log_dasd_state_event(
+                "failure_cache_decision",
+                state,
+                decision_reason="blocked_tokens_present",
+                base_token_index=state.committed_len,
+                blocked_tokens=sorted(blocked_tokens),
+                current_round=state.verify_rounds,
+            )
         return blocked_tokens
 
     def _add_failure_cache_token(self, state: DasdRequestState, token_id: Optional[int]):
@@ -1237,10 +1455,20 @@ class SpecExecClient:
         state.recovery_mode_rounds_left = max(1, config.dasd_recovery_mode_rounds)
         state.recovery_mode_reason = reason
         state.recovery_mode_entries += 1
+        state.recovery_mode_entry_count += 1
+        state.last_recovery_mode_transition_reason = reason
+        self._ensure_base_lifecycle(state, state.committed_len)["recovery_mode_attempts"] += 1
         self._refresh_dasd_control_targets(
             state,
             reason="recovery_mode_enter",
             next_credit=state.window_size,
+        )
+        self._log_dasd_state_event(
+            "recovery_mode_transition",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            transition="enter",
         )
         if config.dasd_debug:
             self._logger.info(
@@ -1309,10 +1537,23 @@ class SpecExecClient:
         state.recovery_mode_active = False
         state.recovery_mode_rounds_left = 0
         state.recovery_mode_reason = ""
+        state.recovery_mode_exit_count += 1
+        state.last_recovery_mode_transition_reason = reason
+        if reason in {"committed_progress", "forced_commit_progress"}:
+            state.recovery_mode_success_count += 1
+        else:
+            state.recovery_mode_failure_count += 1
         self._refresh_dasd_control_targets(
             state,
             reason="recovery_mode_exit",
             next_credit=state.window_size,
+        )
+        self._log_dasd_state_event(
+            "recovery_mode_transition",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            transition="exit",
         )
         if config.dasd_debug:
             self._logger.info(
@@ -1495,26 +1736,49 @@ class SpecExecClient:
             and config.dasd_recovery_forced_commit_enabled
             and state.recovery_mode_active
         ):
+            state.last_forced_commit_decision_reason = "recovery_mode_inactive"
             return False
         if not bool(getattr(response, "forced_commit_eligible", False)):
+            state.last_forced_commit_decision_reason = "not_eligible"
             return False
         if int(getattr(response, "verifier_next_token_id", 0)) < 0:
+            state.last_forced_commit_decision_reason = "missing_verifier_token"
             return False
         if state.forced_commits_by_base.get(base_token_index, 0) >= max(
             1, config.dasd_recovery_forced_commit_max_per_base
         ):
+            state.last_forced_commit_decision_reason = "max_per_base_reached"
             return False
         same_base_retries = state.base_retry_counts.get(base_token_index, 0)
         if (
             same_base_retries
             >= config.dasd_recovery_forced_commit_same_base_retry_threshold
         ):
+            state.last_forced_commit_decision_reason = "same_base_retry_threshold"
+            self._log_dasd_state_event(
+                "forced_commit_decision",
+                state,
+                decision_reason=state.last_forced_commit_decision_reason,
+                base_token_index=base_token_index,
+                forced_commit_eligible=True,
+                verifier_next_token_id=int(getattr(response, "verifier_next_token_id", -1)),
+            )
             return True
         if (
             state.consecutive_full_rejections
             >= config.dasd_recovery_forced_commit_full_rejection_threshold
         ):
+            state.last_forced_commit_decision_reason = "full_rejection_threshold"
+            self._log_dasd_state_event(
+                "forced_commit_decision",
+                state,
+                decision_reason=state.last_forced_commit_decision_reason,
+                base_token_index=base_token_index,
+                forced_commit_eligible=True,
+                verifier_next_token_id=int(getattr(response, "verifier_next_token_id", -1)),
+            )
             return True
+        state.last_forced_commit_decision_reason = "threshold_not_met"
         return False
 
     def _apply_forced_commit(
@@ -1526,7 +1790,11 @@ class SpecExecClient:
         base_token_index = task_info.base_token_index
         token_id = int(getattr(response, "verifier_next_token_id", -1))
         if token_id < 0:
+            state.forced_commit_failure_count += 1
+            state.last_forced_commit_decision_reason = "missing_verifier_token"
             return False
+        state.forced_commit_attempt_count += 1
+        self._ensure_base_lifecycle(state, base_token_index)["forced_commit_attempts"] += 1
         if not self._validate_dasd_token_ids(
             state,
             [token_id],
@@ -1540,6 +1808,8 @@ class SpecExecClient:
                 bundle_id=task_info.bundle_id,
                 base_token_index=base_token_index,
             )
+            state.forced_commit_failure_count += 1
+            state.last_forced_commit_decision_reason = "invalid_forced_commit_token"
             return False
         old_prefix_key = self._dasd_prefix_key(state)
 
@@ -1560,6 +1830,9 @@ class SpecExecClient:
             state.forced_commits_by_base.get(base_token_index, 0) + 1
         )
         state.forced_commit_count += 1
+        state.forced_commit_success_count += 1
+        state.last_forced_commit_decision_reason = "applied"
+        self._ensure_base_lifecycle(state, base_token_index)["forced_commit_successes"] += 1
         state.epoch += 1
         cancelled_task_infos = self._cancel_dasd_inflight(
             state, reason="forced_commit_cleanup"
@@ -1636,6 +1909,8 @@ class SpecExecClient:
                 state.committed_len,
                 len(state.drafted_tokens),
             )
+            state.rollback_due_to_state_inconsistency_count += 1
+            state.last_rollback_cause = "rollback_due_to_state_inconsistency"
             state.drafted_tokens = state.drafted_tokens[: state.committed_len]
             self._log_refill_decision(
                 state,
@@ -1651,6 +1926,8 @@ class SpecExecClient:
                 state.next_base_index,
                 state.committed_len,
             )
+            state.rollback_due_to_state_inconsistency_count += 1
+            state.last_rollback_cause = "rollback_due_to_state_inconsistency"
             state.next_base_index = state.committed_len
             self._log_refill_decision(
                 state,
@@ -1736,11 +2013,27 @@ class SpecExecClient:
             return False, "request_inactive"
         bundle_id = state.next_bundle_id
         base_token_index = state.next_base_index
+        lifecycle = self._ensure_base_lifecycle(state, base_token_index)
+        if state.current_base_tracking is None:
+            state.current_base_tracking = base_token_index
+        elif state.current_base_tracking != base_token_index:
+            self._maybe_emit_base_lifecycle_summary(
+                state,
+                state.current_base_tracking,
+                reason="base_transition",
+            )
+            state.current_base_tracking = base_token_index
         state.base_retry_counts[base_token_index] = (
             state.base_retry_counts.get(base_token_index, 0) + 1
         )
+        lifecycle["send_attempts"] += 1
         if state.base_retry_counts[base_token_index] > 1:
             state.same_base_retry_count += 1
+            lifecycle["same_base_retry_events"] += 1
+            state.per_base_max_same_base_retry_count = max(
+                state.per_base_max_same_base_retry_count,
+                state.base_retry_counts[base_token_index],
+            )
         token_ids = state.drafted_tokens[
             base_token_index : base_token_index + state.window_size
         ]
@@ -1761,6 +2054,26 @@ class SpecExecClient:
                 base_token_index=base_token_index,
             )
             return False, "invalid_token_id"
+        fingerprint_attempts, unique_fingerprints = self._record_retry_fingerprint(
+            state,
+            base_token_index=base_token_index,
+            token_ids=token_ids,
+        )
+        state.per_base_max_retry_count = max(
+            state.per_base_max_retry_count,
+            lifecycle["send_attempts"],
+        )
+        state.last_retry_decision_reason = (
+            "same_base_retry" if state.base_retry_counts[base_token_index] > 1 else "fresh_base_send"
+        )
+        self._log_dasd_state_event(
+            "retry_decision",
+            state,
+            decision_reason=state.last_retry_decision_reason,
+            base_token_index=base_token_index,
+            fingerprint_attempts=fingerprint_attempts,
+            unique_retry_fingerprints=unique_fingerprints,
+        )
 
         send_ts = time.perf_counter()
         task = asyncio.create_task(
@@ -2032,6 +2345,10 @@ class SpecExecClient:
             state.total_accepted_tokens += accepted_len
             state.committed_len += accepted_len
             assert state.committed_len >= prev_committed
+            lifecycle = self._ensure_base_lifecycle(state, prev_committed)
+            lifecycle["accepted_tokens_accumulated"] += accepted_len
+            if accepted_len > 0:
+                lifecycle["progressed"] = True
             if (
                 state.rollback_blocked_committed_len is not None
                 and state.committed_len > state.rollback_blocked_committed_len
@@ -2042,11 +2359,28 @@ class SpecExecClient:
                 state.consecutive_full_rejections += 1
                 state.full_rejection_count += 1
                 state.stall_rounds += 1
+                lifecycle["full_rejections"] += 1
+                state.per_base_max_full_rejection_count = max(
+                    state.per_base_max_full_rejection_count,
+                    lifecycle["full_rejections"],
+                )
             else:
                 state.consecutive_full_rejections = 0
             state.max_full_rejection_streak = max(
                 state.max_full_rejection_streak,
                 state.consecutive_full_rejections,
+            )
+            self._log_dasd_state_event(
+                "rejection_progression",
+                state,
+                decision_reason=(
+                    "full_rejection" if accepted_len == 0 else "partial_or_full_accept"
+                ),
+                base_token_index=prev_committed,
+                verifier_next_token_id=verifier_next_token_id,
+                reject_reason=reject_reason,
+                accepted_len=accepted_len,
+                proposed_len=verified_len,
             )
             forced_commit_applied = False
             if accepted_len > 0:
@@ -2068,6 +2402,17 @@ class SpecExecClient:
                     else "same_base_retry"
                 )
                 self._enter_recovery_mode(state, reason=trigger_reason)
+                self._record_rollback_cause(
+                    state,
+                    cause=(
+                        "rollback_due_to_full_rejection_threshold"
+                        if trigger_reason == "full_rejection_streak"
+                        else "rollback_due_to_same_base_retry_threshold"
+                    ),
+                    base_token_index=prev_committed,
+                    reject_reason=reject_reason,
+                    verifier_next_token_id=verifier_next_token_id,
+                )
             elif state.recovery_mode_active:
                 state.recovery_mode_rounds_left = max(
                     0, state.recovery_mode_rounds_left - 1
@@ -2216,6 +2561,20 @@ class SpecExecClient:
                 if accepted_len < len(task_info.token_ids):
                     failed_first_token = int(task_info.token_ids[accepted_len])
                 self._add_failure_cache_token(state, failed_first_token)
+                rollback_cause = "rollback_due_to_post_recovery_rejection"
+                if state.rollback_blocked_token_id is not None:
+                    rollback_cause = "rollback_due_to_failure_cache_blocked_suffix"
+                if state.recovery_mode_active:
+                    rollback_cause = "rollback_due_to_post_recovery_rejection"
+                self._record_rollback_cause(
+                    state,
+                    cause=rollback_cause,
+                    base_token_index=prev_committed,
+                    reject_reason=reject_reason,
+                    verifier_next_token_id=verifier_next_token_id,
+                    blocked_token=failed_first_token,
+                    forced_commit_applied=forced_commit_applied,
+                )
                 state.rollback_blocked_committed_len = state.committed_len
                 state.rollback_blocked_token_id = failed_first_token
                 state.epoch += 1

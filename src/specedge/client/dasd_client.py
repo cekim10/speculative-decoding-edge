@@ -237,6 +237,30 @@ class DasdRequestState:
     draft_regeneration_no_suffix_count: int = 0
     recovery_resume_success_count: int = 0
     recovery_resume_fail_count: int = 0
+    rollback_due_to_full_rejection_threshold_count: int = 0
+    rollback_due_to_same_base_retry_threshold_count: int = 0
+    rollback_due_to_failure_cache_blocked_suffix_count: int = 0
+    rollback_due_to_forced_commit_failure_count: int = 0
+    rollback_due_to_recovery_mode_entry_count: int = 0
+    rollback_due_to_post_recovery_rejection_count: int = 0
+    rollback_due_to_contiguous_commit_mismatch_count: int = 0
+    rollback_due_to_state_inconsistency_count: int = 0
+    rollback_due_to_retry_loop_breaker_count: int = 0
+    retry_loop_suspected_count: int = 0
+    duplicate_retry_fingerprint_count: int = 0
+    unique_retry_fingerprint_count: int = 0
+    per_base_max_retry_count: int = 0
+    per_base_max_full_rejection_count: int = 0
+    per_base_max_same_base_retry_count: int = 0
+    recovery_mode_entry_count: int = 0
+    recovery_mode_exit_count: int = 0
+    recovery_mode_success_count: int = 0
+    recovery_mode_failure_count: int = 0
+    forced_commit_attempt_count: int = 0
+    forced_commit_success_count: int = 0
+    forced_commit_failure_count: int = 0
+    failure_cache_block_decision_count: int = 0
+    failure_cache_blocked_same_base_retry_count: int = 0
     sum_window_at_send: int = 0
     sum_tree_depth_at_send: int = 0
     sum_leaf_budget_at_send: int = 0
@@ -244,6 +268,10 @@ class DasdRequestState:
     last_refill_skip_reason: str = ""
     last_recovery_failure_reason: str = ""
     last_refill_phase: str = ""
+    last_rollback_cause: str = ""
+    last_retry_decision_reason: str = ""
+    last_recovery_mode_transition_reason: str = ""
+    last_forced_commit_decision_reason: str = ""
     cleanup_reason: str = ""
     cleanup_induced_drain: bool = False
     base_retry_counts: dict[int, int] = field(default_factory=dict)
@@ -259,6 +287,9 @@ class DasdRequestState:
     fallback_burst_total_steps: int = 0
     fallback_burst_sync_base: Optional[int] = None
     fallback_burst_sync_token_id: Optional[int] = None
+    base_lifecycle: dict[int, dict[str, Any]] = field(default_factory=dict)
+    retry_fingerprints_by_base: dict[int, dict[Any, int]] = field(default_factory=dict)
+    current_base_tracking: Optional[int] = None
 
     def speculative_tokens(self):
         return max(0, len(self.drafted_tokens) - self.committed_len)

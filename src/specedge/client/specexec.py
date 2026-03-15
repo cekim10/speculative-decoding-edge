@@ -411,8 +411,12 @@ class SpecExecClient:
 
     def _current_dasd_inflight_cap(self, state: DasdRequestState):
         conservative_mode = self._update_pipeline_mode(state)
+        effective_credit = self._effective_dasd_credit(state)
         credit_cap = (
-            state.credit_controller.current_inflight_cap(config.dasd_max_inflight_bundles)
+            state.credit_controller.current_inflight_cap(
+                config.dasd_max_inflight_bundles,
+                effective_credit=effective_credit,
+            )
             if state.credit_controller is not None
             else config.dasd_max_inflight_bundles
         )
@@ -545,7 +549,18 @@ class SpecExecClient:
                 state,
                 decision_reason=reason,
                 base_token_index=state.committed_len,
-            )
+        )
+
+    def _effective_dasd_credit(self, state: DasdRequestState):
+        if state.credit_controller is None:
+            return None
+        effective_credit = state.credit_controller.credit
+        if state.instability_credit_cap is not None:
+            effective_credit = min(effective_credit, state.instability_credit_cap)
+        return max(
+            state.credit_controller.credit_min,
+            min(state.credit_controller.credit_max, effective_credit),
+        )
 
     def _enter_hard_stabilization(
         self,
@@ -611,6 +626,7 @@ class SpecExecClient:
             return
         state.instability_credit_clamp_active = False
         state.instability_credit_clamp_remaining = 0
+        state.instability_credit_cap = None
         state.last_instability_clamp_reason = reason
         state.instability_credit_clamp_exit_count += 1
         self._log_dasd_state_event(
@@ -621,6 +637,12 @@ class SpecExecClient:
         )
 
     def _record_instability_activity(self, state: DasdRequestState, reason: str):
+        if reason not in {
+            "committed_progress",
+            "forced_commit_progress",
+            "fallback_burst_progress",
+        }:
+            return
         if state.hard_stabilization_active:
             state.hard_stabilization_remaining_sends = max(
                 0, state.hard_stabilization_remaining_sends - 1
@@ -735,12 +757,15 @@ class SpecExecClient:
         if rollback_distance <= 8:
             credit_penalty = 1
             clamp_rounds = 2
+            credit_cap = 8
         elif rollback_distance <= 32:
             credit_penalty = 2
             clamp_rounds = 3
+            credit_cap = 6
         else:
             credit_penalty = 4
             clamp_rounds = 4
+            credit_cap = 4
         state.rollback_distance_penalty_count += 1
         state.rollback_distance_penalty_total += rollback_distance
         state.rollback_distance_last_reason = reason
@@ -749,6 +774,18 @@ class SpecExecClient:
             state.credit_controller.credit = max(
                 state.credit_controller.credit_min,
                 state.credit_controller.credit - credit_penalty,
+            )
+            state.instability_credit_cap = max(
+                state.credit_controller.credit_min,
+                min(
+                    state.credit_controller.credit_max,
+                    min(
+                        credit_cap,
+                        state.instability_credit_cap
+                        if state.instability_credit_cap is not None
+                        else credit_cap,
+                    ),
+                ),
             )
         if not state.instability_credit_clamp_active:
             state.instability_credit_clamp_entry_count += 1
@@ -766,6 +803,7 @@ class SpecExecClient:
             rollback_distance=rollback_distance,
             credit_penalty=credit_penalty,
             clamp_rounds=clamp_rounds,
+            effective_credit_cap=state.instability_credit_cap,
         )
         self._log_dasd_state_event(
             "instability_credit_clamp_enter",
@@ -774,6 +812,7 @@ class SpecExecClient:
             base_token_index=state.committed_len,
             rollback_distance=rollback_distance,
             remaining=state.instability_credit_clamp_remaining,
+            effective_credit_cap=state.instability_credit_cap,
         )
 
     def _enter_pipeline_resume_grace(
@@ -3304,6 +3343,8 @@ class SpecExecClient:
                     if state.credit_controller is not None
                     else None
                 ),
+                "final_effective_credit": self._effective_dasd_credit(state),
+                "final_effective_credit_cap": state.instability_credit_cap,
                 "final_acceptance_ratio": (
                     state.total_accepted_tokens / state.total_verified_tokens
                     if state.total_verified_tokens > 0
@@ -3351,6 +3392,7 @@ class SpecExecClient:
 
         previous_window = state.window_size
         previous_tree_budget = state.tree_budget
+        effective_credit = self._effective_dasd_credit(state)
 
         if (
             config.dasd_adaptive_credit_enabled
@@ -3364,7 +3406,10 @@ class SpecExecClient:
                 if previous_window > 0
                 else max(config.dasd_w_min, min(config.dasd_w_max, config.dasd_start_window))
             )
-            state.window_size = state.credit_controller.current_window(fallback_window)
+            state.window_size = state.credit_controller.current_window(
+                fallback_window,
+                effective_credit=effective_credit,
+            )
         elif next_credit is not None and next_credit > 0:
             state.window_size = max(
                 config.dasd_w_min, min(config.dasd_w_max, int(next_credit))
@@ -3375,6 +3420,7 @@ class SpecExecClient:
             fallback_leaf_budget=self._fixed_max_budget,
             fallback_max_n_beams=self._fixed_max_n_beams,
             fallback_max_branch_width=self._fixed_max_branch_width,
+            effective_credit=effective_credit,
         )
 
         if state.frontier_sync_active:
@@ -3456,6 +3502,8 @@ class SpecExecClient:
                     and config.dasd_adaptive_window_enabled
                 ),
                 "credit": state.credit_controller.credit,
+                "effective_credit": effective_credit,
+                "effective_credit_cap": state.instability_credit_cap,
                 "min_window": config.dasd_min_window,
                 "max_window": config.dasd_max_window,
                 "chosen_window": state.window_size,
@@ -3463,9 +3511,12 @@ class SpecExecClient:
             }
             feedback["inflight_mapping"] = {
                 "credit": state.credit_controller.credit,
+                "effective_credit": effective_credit,
+                "effective_credit_cap": state.instability_credit_cap,
                 "chosen_inflight_cap": (
                     state.credit_controller.current_inflight_cap(
-                        config.dasd_max_inflight_bundles
+                        config.dasd_max_inflight_bundles,
+                        effective_credit=effective_credit,
                     )
                 ),
                 "max_inflight_bundles": config.dasd_max_inflight_bundles,
@@ -3476,6 +3527,8 @@ class SpecExecClient:
                     and config.dasd_adaptive_tree_budget_enabled
                 ),
                 "credit": state.credit_controller.credit,
+                "effective_credit": effective_credit,
+                "effective_credit_cap": state.instability_credit_cap,
                 "min_tree_depth": config.dasd_min_tree_depth,
                 "max_tree_depth": config.dasd_max_tree_depth,
                 "min_leaf_budget": config.dasd_min_leaf_budget,
@@ -3485,13 +3538,14 @@ class SpecExecClient:
 
         if config.dasd_debug:
             self._logger.info(
-                "[DASD] credit_control req=%s epoch=%d reason=%s adaptive=%s credit_before=%s raw_delta=%s unclamped=%s clamped=%s credit_after=%s accepted=%s proposed=%s rejected=%s strong_accept_streak=%s->%s full_rejection_streak=%s->%s W_before=%s W_after=%s window_mapping=%s tree_before=%s tree_after=%s tree_mapping=%s",
+                "[DASD] credit_control req=%s epoch=%d reason=%s adaptive=%s credit_before=%s raw_delta=%s controller_delta=%s unclamped=%s clamped=%s credit_after=%s accepted=%s proposed=%s rejected=%s strong_accept_streak=%s->%s full_rejection_streak=%s->%s W_before=%s W_after=%s window_mapping=%s tree_before=%s tree_after=%s tree_mapping=%s",
                 state.request_id,
                 state.epoch,
                 reason,
                 feedback.get("adaptive_enabled") if feedback is not None else None,
                 feedback.get("credit_before") if feedback is not None else state.credit_controller.credit,
                 feedback.get("raw_delta") if feedback is not None else None,
+                feedback.get("controller_delta") if feedback is not None else None,
                 feedback.get("unclamped_credit") if feedback is not None else None,
                 feedback.get("clamped_credit") if feedback is not None else None,
                 feedback.get("credit_after") if feedback is not None else state.credit_controller.credit,
@@ -5012,6 +5066,11 @@ class SpecExecClient:
                         if control_feedback is not None
                         else None
                     ),
+                    "controller_delta": (
+                        control_feedback.get("controller_delta")
+                        if control_feedback is not None
+                        else None
+                    ),
                     "strong_accept_streak": (
                         control_feedback.get("strong_accept_streak")
                         if control_feedback is not None
@@ -5023,6 +5082,8 @@ class SpecExecClient:
                         else None
                     ),
                     "chosen_window": state.window_size,
+                    "effective_credit": self._effective_dasd_credit(state),
+                    "effective_credit_cap": state.instability_credit_cap,
                     "chosen_tree_depth": (
                         state.tree_budget.max_beam_len
                         if state.tree_budget is not None

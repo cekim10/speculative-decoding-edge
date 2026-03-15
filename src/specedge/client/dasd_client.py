@@ -61,12 +61,13 @@ class DasdCreditController:
         acceptance_ratio = (
             float(accepted_len) / float(proposed_len) if proposed_len > 0 else 0.0
         )
+        small_repair_round = proposed_len > 0 and proposed_len <= 2
         streak_before = {
             "strong_accept_streak": self.strong_accept_streak,
             "full_rejection_streak": self.full_rejection_streak,
         }
 
-        if proposed_len > 0 and accepted_len == proposed_len:
+        if proposed_len > 2 and accepted_len == proposed_len:
             self.strong_accept_streak += 1
             self.full_rejection_streak = 0
         elif accepted_len == 0 and proposed_len > 0:
@@ -76,33 +77,42 @@ class DasdCreditController:
             self.strong_accept_streak = 0
             self.full_rejection_streak = 0
 
-        unclamped_credit = self.credit
+        unclamped_credit = float(self.credit)
+        controller_delta = 0
 
         if self.adaptive_enabled:
             self.acceptance_ratio_ema = 0.8 * self.acceptance_ratio_ema + 0.2 * acceptance_ratio
             self.rtt_ema_ms = 0.8 * self.rtt_ema_ms + 0.2 * max(0.0, float(rtt_ms))
             self.inflight_ema = 0.8 * self.inflight_ema + 0.2 * max(0, inflight_count)
+            rtt_pressure_ms = max(float(rtt_ms), self.rtt_ema_ms)
+            if proposed_len <= 0:
+                controller_delta = 0
+            elif accepted_len == 0:
+                controller_delta = -3
+            elif acceptance_ratio < 0.2:
+                controller_delta = -2
+            elif acceptance_ratio < 0.4:
+                controller_delta = -1
+            elif small_repair_round:
+                # W<=2 full accepts are repair proof, not evidence to reopen aggressively.
+                controller_delta = 0
+            elif acceptance_ratio >= 0.8:
+                controller_delta = 1
+            elif acceptance_ratio >= max(0.6, self.target_acceptance_ratio):
+                controller_delta = 1
 
-            acceptance_term = self.alpha * (
-                self.acceptance_ratio_ema - self.target_acceptance_ratio
-            )
-            rtt_term = 0.0
             if self.rtt_target_ms > 0:
-                rtt_term = self.rtt_gain * max(
-                    0.0, (self.rtt_ema_ms - self.rtt_target_ms) / self.rtt_target_ms
-                )
-            inflight_gap = max(0.0, float(self.credit) - self.inflight_ema)
-            inflight_term = self.inflight_gain * min(
-                1.0,
-                inflight_gap / max(1.0, float(self.credit_max)),
-            )
-            unclamped_credit = float(self.credit) + acceptance_term + rtt_term + inflight_term
-            if proposed_len > 0 and accepted_len == 0:
-                unclamped_credit -= float(self.rejection_penalty)
-            elif proposed_len > 0 and accepted_len == proposed_len:
-                unclamped_credit += float(self.success_bonus)
+                if rtt_pressure_ms >= max(self.rtt_target_ms * 3.0, 180.0):
+                    if acceptance_ratio < 0.6:
+                        controller_delta -= 1
+                    else:
+                        controller_delta = min(controller_delta, 0)
+                elif rtt_pressure_ms >= max(self.rtt_target_ms * 2.0, 120.0):
+                    controller_delta = min(controller_delta, 0)
 
-            if proposed_len > 0 and accepted_len == 0:
+            controller_delta = max(-3, min(1, controller_delta))
+            unclamped_credit = float(self.credit) + float(controller_delta)
+            if accepted_len == 0:
                 unclamped_credit = min(float(self.credit), unclamped_credit)
 
             self.credit = max(
@@ -128,17 +138,20 @@ class DasdCreditController:
             "rtt_ema_ms": self.rtt_ema_ms,
             "inflight_count": inflight_count,
             "inflight_ema": self.inflight_ema,
+            "controller_delta": controller_delta,
+            "small_repair_round": small_repair_round,
             "strong_accept_streak_before": streak_before["strong_accept_streak"],
             "full_rejection_streak_before": streak_before["full_rejection_streak"],
             "strong_accept_streak": self.strong_accept_streak,
             "full_rejection_streak": self.full_rejection_streak,
         }
 
-    def current_window(self, fallback: int):
+    def current_window(self, fallback: int, effective_credit: Optional[int] = None):
         if not (self.adaptive_enabled and self.adaptive_window_enabled):
             return fallback
+        credit = self.credit if effective_credit is None else effective_credit
         return self._map_range(
-            self.credit,
+            credit,
             self.credit_min,
             self.credit_max,
             self.min_window,
@@ -151,6 +164,7 @@ class DasdCreditController:
         fallback_leaf_budget: int,
         fallback_max_n_beams: int,
         fallback_max_branch_width: int,
+        effective_credit: Optional[int] = None,
     ):
         if not (self.adaptive_enabled and self.adaptive_tree_budget_enabled):
             return DasdTreeBudget(
@@ -160,8 +174,9 @@ class DasdCreditController:
                 max_branch_width=fallback_max_branch_width,
             )
 
+        credit = self.credit if effective_credit is None else effective_credit
         max_beam_len = self._map_range(
-            self.credit,
+            credit,
             self.credit_min,
             self.credit_max,
             self.min_tree_depth,
@@ -169,7 +184,7 @@ class DasdCreditController:
         )
         max_beam_len = max(1, min(fallback_depth, max_beam_len))
         max_budget = self._map_range(
-            self.credit,
+            credit,
             self.credit_min,
             self.credit_max,
             self.min_leaf_budget,
@@ -184,15 +199,16 @@ class DasdCreditController:
             max_branch_width=max(1, min(fallback_max_branch_width, max_budget)),
         )
 
-    def current_inflight_cap(self, fallback: int):
+    def current_inflight_cap(self, fallback: int, effective_credit: Optional[int] = None):
         if not self.adaptive_enabled:
             return fallback
+        credit = self.credit if effective_credit is None else effective_credit
         return max(
             1,
             min(
                 fallback,
                 self._map_range(
-                    self.credit,
+                    credit,
                     self.credit_min,
                     self.credit_max,
                     1,
@@ -420,6 +436,7 @@ class DasdRequestState:
     rollback_distance_last_reason: str = ""
     instability_credit_clamp_active: bool = False
     instability_credit_clamp_remaining: int = 0
+    instability_credit_cap: int | None = None
     instability_credit_clamp_entry_count: int = 0
     instability_credit_clamp_exit_count: int = 0
     instability_growth_clamp_count: int = 0

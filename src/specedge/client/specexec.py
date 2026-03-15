@@ -415,6 +415,19 @@ class SpecExecClient:
                 inflight_cap=1,
             )
             return 1
+        instability_window_cap = self._instability_window_cap(state)
+        if instability_window_cap is not None:
+            effective_cap = max(1, min(config.dasd_max_inflight_bundles, instability_window_cap))
+            state.instability_growth_clamp_count += 1
+            self._log_dasd_state_event(
+                "effective_controller_caps",
+                state,
+                decision_reason="instability_growth_cap",
+                base_token_index=state.committed_len,
+                inflight_cap=effective_cap,
+                window_cap=instability_window_cap,
+            )
+            return effective_cap
         if conservative_mode:
             state.unstable_phase_inflight_cap_hits += 1
             self._log_dasd_state_event(
@@ -516,6 +529,215 @@ class SpecExecClient:
                 decision_reason=reason,
                 base_token_index=state.committed_len,
             )
+
+    def _enter_hard_stabilization(
+        self,
+        state: DasdRequestState,
+        reason: str,
+        sends: int = 3,
+    ):
+        previous_active = state.hard_stabilization_active
+        state.hard_stabilization_active = True
+        state.hard_stabilization_remaining_sends = max(
+            state.hard_stabilization_remaining_sends,
+            max(1, sends),
+        )
+        state.hard_stabilization_reason = reason
+        state.last_hard_stabilization_reason = reason
+        if not previous_active:
+            state.hard_stabilization_entry_count += 1
+        self._refresh_dasd_control_targets(
+            state,
+            reason="hard_stabilization_enter",
+            next_credit=state.window_size,
+        )
+        self._log_dasd_state_event(
+            "hard_stabilization_enter",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            remaining_sends=state.hard_stabilization_remaining_sends,
+        )
+
+    def _exit_hard_stabilization(
+        self,
+        state: DasdRequestState,
+        reason: str,
+        success: bool,
+    ):
+        if not state.hard_stabilization_active:
+            return
+        state.hard_stabilization_active = False
+        state.hard_stabilization_remaining_sends = 0
+        state.hard_stabilization_reason = ""
+        state.hard_stabilization_exit_count += 1
+        state.last_hard_stabilization_reason = reason
+        if success:
+            state.hard_stabilization_success_count += 1
+        else:
+            state.hard_stabilization_fail_count += 1
+        self._refresh_dasd_control_targets(
+            state,
+            reason="hard_stabilization_exit",
+            next_credit=state.window_size,
+        )
+        self._log_dasd_state_event(
+            "hard_stabilization_exit",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            success=success,
+        )
+
+    def _exit_instability_credit_clamp(self, state: DasdRequestState, reason: str):
+        if not state.instability_credit_clamp_active:
+            return
+        state.instability_credit_clamp_active = False
+        state.instability_credit_clamp_remaining = 0
+        state.last_instability_clamp_reason = reason
+        state.instability_credit_clamp_exit_count += 1
+        self._log_dasd_state_event(
+            "instability_credit_clamp_exit",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+        )
+
+    def _record_instability_activity(self, state: DasdRequestState, reason: str):
+        if state.hard_stabilization_active:
+            state.hard_stabilization_remaining_sends = max(
+                0, state.hard_stabilization_remaining_sends - 1
+            )
+            if state.hard_stabilization_remaining_sends == 0:
+                self._exit_hard_stabilization(state, reason=reason, success=True)
+        if state.instability_credit_clamp_active:
+            state.instability_credit_clamp_remaining = max(
+                0, state.instability_credit_clamp_remaining - 1
+            )
+            if state.instability_credit_clamp_remaining == 0:
+                self._exit_instability_credit_clamp(state, reason=reason)
+
+    def _instability_window_cap(self, state: DasdRequestState):
+        cap = None
+        if state.hard_stabilization_active:
+            cap = 2
+        if state.cooldown_active:
+            cap = 2 if cap is None else min(cap, 2)
+        if state.instability_credit_clamp_active:
+            clamp_cap = 1 if state.last_rollback_distance > 32 else 2
+            cap = clamp_cap if cap is None else min(cap, clamp_cap)
+        return cap
+
+    def _instability_tree_budget_cap(self, state: DasdRequestState):
+        if not (
+            state.hard_stabilization_active
+            or state.cooldown_active
+            or state.instability_credit_clamp_active
+        ):
+            return None
+        max_depth = 1 if state.instability_credit_clamp_active else 2
+        return DasdTreeBudget(
+            max_beam_len=max(1, min(self._fixed_max_beam_len, max_depth)),
+            max_budget=max(2, min(self._fixed_max_budget, 4)),
+            max_n_beams=max(1, min(self._fixed_max_n_beams, 4)),
+            max_branch_width=max(1, min(self._fixed_max_branch_width, 4)),
+        )
+
+    def _instability_repair_horizon(self, state: DasdRequestState):
+        if not (
+            state.hard_stabilization_active
+            or state.instability_credit_clamp_active
+            or state.local_stabilization_active
+            or state.cooldown_active
+            or state.recovery_mode_active
+        ):
+            return None
+        if state.instability_credit_clamp_active and state.last_rollback_distance > 32:
+            return 2
+        return 4
+
+    def _effective_regeneration_end(
+        self,
+        state: DasdRequestState,
+        min_required_end: int,
+        phase: str,
+    ):
+        repair_horizon = self._instability_repair_horizon(state)
+        if repair_horizon is None:
+            return min_required_end
+        clamped_end = min(min_required_end, state.committed_len + repair_horizon)
+        if clamped_end < min_required_end:
+            state.regeneration_instability_clamp_count += 1
+            self._log_dasd_state_event(
+                "regeneration_clamped_for_instability",
+                state,
+                decision_reason=phase,
+                base_token_index=state.committed_len,
+                requested_end=min_required_end,
+                clamped_end=clamped_end,
+                repair_horizon=repair_horizon,
+            )
+        return clamped_end
+
+    def _apply_rollback_distance_penalty(
+        self,
+        state: DasdRequestState,
+        *,
+        reason: str,
+        before_next_base: int,
+        after_next_base: int,
+    ):
+        rollback_distance = max(0, before_next_base - after_next_base)
+        state.last_rollback_distance = rollback_distance
+        state.max_rollback_distance = max(
+            state.max_rollback_distance,
+            rollback_distance,
+        )
+        if rollback_distance <= 2:
+            return
+        if rollback_distance <= 8:
+            credit_penalty = 1
+            clamp_rounds = 2
+        elif rollback_distance <= 32:
+            credit_penalty = 2
+            clamp_rounds = 3
+        else:
+            credit_penalty = 4
+            clamp_rounds = 4
+        state.rollback_distance_penalty_count += 1
+        state.rollback_distance_penalty_total += rollback_distance
+        state.rollback_distance_last_reason = reason
+        state.last_rollback_distance_penalty_reason = reason
+        if state.credit_controller is not None:
+            state.credit_controller.credit = max(
+                state.credit_controller.credit_min,
+                state.credit_controller.credit - credit_penalty,
+            )
+        if not state.instability_credit_clamp_active:
+            state.instability_credit_clamp_entry_count += 1
+        state.instability_credit_clamp_active = True
+        state.instability_credit_clamp_remaining = max(
+            state.instability_credit_clamp_remaining,
+            clamp_rounds,
+        )
+        state.last_instability_clamp_reason = reason
+        self._log_dasd_state_event(
+            "rollback_distance_penalty_applied",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            rollback_distance=rollback_distance,
+            credit_penalty=credit_penalty,
+            clamp_rounds=clamp_rounds,
+        )
+        self._log_dasd_state_event(
+            "instability_credit_clamp_enter",
+            state,
+            decision_reason=reason,
+            base_token_index=state.committed_len,
+            rollback_distance=rollback_distance,
+            remaining=state.instability_credit_clamp_remaining,
+        )
 
     def _enter_pipeline_resume_grace(
         self, state: DasdRequestState, reason: str, sends: int = 2
@@ -1922,6 +2144,12 @@ class SpecExecClient:
             or before_drafted_len != len(state.drafted_tokens)
             or before_pending_responses > 0
         ):
+            self._apply_rollback_distance_penalty(
+                state,
+                reason=reason,
+                before_next_base=before_next_base,
+                after_next_base=state.next_base_index,
+            )
             self._logger.info(
                 "[DASD] inconsistency_detected req=%s epoch=%d reason=%s before_next_base=%d after_next_base=%d before_drafted_len=%d after_drafted_len=%d pending_responses_before=%d correction_applied=True",
                 state.request_id,
@@ -2000,6 +2228,12 @@ class SpecExecClient:
             before_next_base != state.next_base_index
             or before_pending_responses > 0
         ):
+            self._apply_rollback_distance_penalty(
+                state,
+                reason=reason,
+                before_next_base=before_next_base,
+                after_next_base=state.next_base_index,
+            )
             self._logger.info(
                 "[DASD] inconsistency_detected req=%s epoch=%d reason=%s before_next_base=%d after_next_base=%d drafted_len=%d pending_responses_before=%d correction_applied=True",
                 state.request_id,
@@ -2018,6 +2252,11 @@ class SpecExecClient:
         phase: str,
         max_attempts: int = 3,
     ):
+        min_required_end = self._effective_regeneration_end(
+            state,
+            min_required_end=min_required_end,
+            phase=phase,
+        )
         if len(state.drafted_tokens) >= min_required_end:
             return True, "suffix_already_available"
 
@@ -2177,6 +2416,7 @@ class SpecExecClient:
             state.suffix_refresh_success_count += 1
             state.rollback_cleanup_avoided_count += 1
             state.cheap_recovery_success_count += 1
+            self._enter_hard_stabilization(state, reason="suffix_refresh_success")
             self._exit_local_stabilization(
                 state,
                 reason="suffix_refresh_success",
@@ -2375,6 +2615,7 @@ class SpecExecClient:
             if state.inflight:
                 state.refill_success_count += 1
                 state.recovery_resume_success_count += 1
+                self._enter_hard_stabilization(state, reason="rebuild_recovery_success")
                 self._enter_pipeline_resume_grace(
                     state,
                     reason="rebuild_recovery_success",
@@ -2767,6 +3008,12 @@ class SpecExecClient:
             success=finish_status in {"eos_reached", "max_new_tokens_reached"},
         )
         self._reset_recovery_resend_relax_state(state, reason=finish_status)
+        self._exit_hard_stabilization(
+            state,
+            reason=finish_status,
+            success=finish_status in {"eos_reached", "max_new_tokens_reached"},
+        )
+        self._exit_instability_credit_clamp(state, reason=finish_status)
         self._exit_frontier_sync(
             state,
             reason=finish_status,
@@ -2940,6 +3187,17 @@ class SpecExecClient:
                 "frontier_local_tiny_rebuild_root_step_mask_filtered_candidate_count": state.frontier_local_tiny_rebuild_root_step_mask_filtered_candidate_count,
                 "frontier_local_tiny_rebuild_root_step_mask_all_blocked_fail_count": state.frontier_local_tiny_rebuild_root_step_mask_all_blocked_fail_count,
                 "frontier_local_tiny_rebuild_root_step_mask_last_reason": state.frontier_local_tiny_rebuild_root_step_mask_last_reason,
+                "hard_stabilization_entry_count": state.hard_stabilization_entry_count,
+                "hard_stabilization_exit_count": state.hard_stabilization_exit_count,
+                "hard_stabilization_success_count": state.hard_stabilization_success_count,
+                "hard_stabilization_fail_count": state.hard_stabilization_fail_count,
+                "rollback_distance_penalty_count": state.rollback_distance_penalty_count,
+                "rollback_distance_penalty_total": state.rollback_distance_penalty_total,
+                "max_rollback_distance": state.max_rollback_distance,
+                "instability_credit_clamp_entry_count": state.instability_credit_clamp_entry_count,
+                "instability_credit_clamp_exit_count": state.instability_credit_clamp_exit_count,
+                "instability_growth_clamp_count": state.instability_growth_clamp_count,
+                "regeneration_instability_clamp_count": state.regeneration_instability_clamp_count,
                 "cooldown_active": state.cooldown_active,
                 "cooldown_entry_count": state.cooldown_entry_count,
                 "cooldown_exit_count": state.cooldown_exit_count,
@@ -2968,6 +3226,9 @@ class SpecExecClient:
                 "last_pipeline_resume_reason": state.last_pipeline_resume_reason,
                 "last_recovery_resend_relax_reason": state.last_recovery_resend_relax_reason,
                 "last_conservative_forward_reason": state.last_conservative_forward_reason,
+                "last_hard_stabilization_reason": state.last_hard_stabilization_reason,
+                "last_rollback_distance_penalty_reason": state.last_rollback_distance_penalty_reason,
+                "last_instability_clamp_reason": state.last_instability_clamp_reason,
                 "average_W": (
                     state.sum_window_at_send / state.verify_rounds
                     if state.verify_rounds > 0
@@ -3099,6 +3360,41 @@ class SpecExecClient:
                     state.window_size,
                     state.tree_budget,
                 )
+
+        instability_window_cap = self._instability_window_cap(state)
+        instability_tree_cap = self._instability_tree_budget_cap(state)
+        if instability_window_cap is not None:
+            state.window_size = max(1, min(state.window_size, instability_window_cap))
+        if instability_tree_cap is not None and state.tree_budget is not None:
+            state.tree_budget = DasdTreeBudget(
+                max_beam_len=max(1, min(state.tree_budget.max_beam_len, instability_tree_cap.max_beam_len)),
+                max_budget=max(1, min(state.tree_budget.max_budget, instability_tree_cap.max_budget)),
+                max_n_beams=max(1, min(state.tree_budget.max_n_beams, instability_tree_cap.max_n_beams)),
+                max_branch_width=max(1, min(state.tree_budget.max_branch_width, instability_tree_cap.max_branch_width)),
+            )
+        if instability_window_cap is not None or instability_tree_cap is not None:
+            state.instability_growth_clamp_count += 1
+            self._log_dasd_state_event(
+                "effective_controller_caps",
+                state,
+                decision_reason=reason,
+                base_token_index=state.committed_len,
+                effective_window=state.window_size,
+                inflight_cap=(
+                    max(1, min(config.dasd_max_inflight_bundles, instability_window_cap))
+                    if instability_window_cap is not None
+                    else None
+                ),
+                effective_tree_depth=(
+                    state.tree_budget.max_beam_len if state.tree_budget is not None else None
+                ),
+                effective_leaf_budget=(
+                    state.tree_budget.max_budget if state.tree_budget is not None else None
+                ),
+                effective_branch_width=(
+                    state.tree_budget.max_branch_width if state.tree_budget is not None else None
+                ),
+            )
 
         if feedback is not None:
             feedback["window_mapping"] = {
@@ -3543,6 +3839,7 @@ class SpecExecClient:
         self._reset_alternative_frontier_search_state(
             state, reason="fallback_burst_progress"
         )
+        self._record_instability_activity(state, reason="fallback_burst_progress")
         state.consecutive_full_rejections = 0
         state.rollback_blocked_committed_len = None
         state.rollback_blocked_token_id = None
@@ -3550,6 +3847,7 @@ class SpecExecClient:
         state.base_retry_counts.pop(base_token_index, None)
         self._reset_tree_from_dasd_state(state, use_full_drafted=False)
         self._enter_frontier_sync(state, reason="fallback_burst_progress")
+        self._enter_hard_stabilization(state, reason="fallback_burst_progress")
         self._enter_pipeline_resume_grace(state, reason="fallback_burst_progress")
         self._enter_recovery_resend_relax(state, reason="fallback_burst_progress")
         blocked_tokens = sorted(self._blocked_tokens_for_prefix(state))
@@ -3738,6 +4036,7 @@ class SpecExecClient:
             sync_token_id=token_id,
         )
         self._enter_frontier_sync(state, reason="forced_commit_progress")
+        self._enter_hard_stabilization(state, reason="forced_commit_success")
         self._enter_pipeline_resume_grace(state, reason="forced_commit_success")
         self._enter_recovery_resend_relax(state, reason="forced_commit_success")
         self._exit_local_stabilization(
@@ -4216,6 +4515,7 @@ class SpecExecClient:
         state.cleanup_induced_drain = False
         self._reset_suppressed_retry_loop_state(state, reason="send_spawned")
         self._reset_alternative_frontier_search_state(state, reason="send_spawned")
+        self._record_instability_activity(state, reason="send_spawned")
         if state.cleanup_reason == "rollback_cleanup" and not state.frontier_sync_active:
             self._enter_pipeline_resume_grace(
                 state,
@@ -4475,6 +4775,7 @@ class SpecExecClient:
                 self._reset_alternative_frontier_search_state(
                     state, reason="committed_progress"
                 )
+                self._record_instability_activity(state, reason="committed_progress")
                 self._exit_pipeline_resume_grace(
                     state,
                     reason="committed_progress",
@@ -4864,6 +5165,8 @@ class SpecExecClient:
         self._reset_alternative_frontier_search_state(state, reason=reason)
         self._exit_pipeline_resume_grace(state, reason=reason, success=False)
         self._reset_recovery_resend_relax_state(state, reason=reason)
+        self._exit_hard_stabilization(state, reason=reason, success=False)
+        self._exit_instability_credit_clamp(state, reason=reason)
         self._exit_frontier_sync(state, reason=reason, success=False)
         if state.abort_reason == "":
             state.abort_reason = reason

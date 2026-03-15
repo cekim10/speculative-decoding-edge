@@ -74,7 +74,15 @@ def main(config_file: str):
     # experiment configuration
     max_new_tokens = config["client"]["max_new_tokens"]
     max_request_num = config["client"]["max_request_num"]
-    mode = config.get("mode", "specedge")
+    decoding_mode = config.get(
+        "decoding_mode",
+        "async_credit_heterogeneous" if config.get("mode", "specedge") == "dasd" else "sync_speculative",
+    )
+    mode = (
+        "dasd"
+        if decoding_mode in {"async_speculative_homogeneous", "async_credit_heterogeneous"}
+        else "specedge"
+    )
     dasd_cfg = config.get("dasd", {})
     max_client_processes = int(config["server"]["num_clients"])
 
@@ -89,10 +97,37 @@ def main(config_file: str):
             if client_idx >= max_client_processes:
                 break
             device = client_info["device"]
-            client_drafter_model = client_info.get(
-                "drafter_model",
-                client_info.get("draft_model", draft_model),
+            client_drafter_model = (
+                draft_model
+                if decoding_mode == "async_speculative_homogeneous"
+                else client_info.get(
+                    "drafter_model",
+                    client_info.get("draft_model", draft_model),
+                )
             )
+            effective_enable_async = decoding_mode in {
+                "async_speculative_homogeneous",
+                "async_credit_heterogeneous",
+            }
+            adaptive_credit_enabled = (
+                decoding_mode == "async_credit_heterogeneous"
+                and dasd_cfg.get("adaptive_credit_enabled", True)
+            )
+            adaptive_window_enabled = (
+                decoding_mode == "async_credit_heterogeneous"
+                and dasd_cfg.get("adaptive_window_enabled", True)
+            )
+            adaptive_tree_budget_enabled = (
+                decoding_mode == "async_credit_heterogeneous"
+                and dasd_cfg.get("adaptive_tree_budget_enabled", True)
+            )
+            effective_proactive_type = (
+                "disabled" if decoding_mode == "autoregressive" else proactive_type
+            )
+            effective_max_n_beams = 1 if decoding_mode == "autoregressive" else max_n_beams
+            effective_max_beam_len = 1 if decoding_mode == "autoregressive" else max_beam_len
+            effective_max_branch_width = 1 if decoding_mode == "autoregressive" else max_branch_width
+            effective_max_budget = 1 if decoding_mode == "autoregressive" else max_budget
 
             logger.info("Starting a client_%s on %s, %s", client_idx, node_name, device)
 
@@ -108,11 +143,11 @@ def main(config_file: str):
                 "SPECEDGE_DEVICE": device,
                 "SPECEDGE_DTYPE": dtype,
                 "SPECEDGE_DATASET": dataset,
-                "SPECEDGE_MAX_N_BEAMS": max_n_beams,
-                "SPECEDGE_MAX_BEAM_LEN": max_beam_len,
-                "SPECEDGE_MAX_BRANCH_WIDTH": max_branch_width,
-                "SPECEDGE_MAX_BUDGET": max_budget,
-                "SPECEDGE_PROACTIVE_TYPE": proactive_type,
+                "SPECEDGE_MAX_N_BEAMS": effective_max_n_beams,
+                "SPECEDGE_MAX_BEAM_LEN": effective_max_beam_len,
+                "SPECEDGE_MAX_BRANCH_WIDTH": effective_max_branch_width,
+                "SPECEDGE_MAX_BUDGET": effective_max_budget,
+                "SPECEDGE_PROACTIVE_TYPE": effective_proactive_type,
                 "SPECEDGE_PROACTIVE_MAX_N_BEAMS": proactive_max_n_beams,
                 "SPECEDGE_PROACTIVE_MAX_BEAM_LEN": proactive_max_beam_len,
                 "SPECEDGE_PROACTIVE_MAX_BRANCH_WIDTH": proactive_max_branch_width,
@@ -125,7 +160,8 @@ def main(config_file: str):
                 "SPECEDGE_CLIENT_IDX": client_idx,
                 "SPECEDGE_REASONING": reasoning,
                 "SPECEDGE_MODE": mode,
-                "SPECEDGE_DASD_ENABLE_ASYNC": dasd_cfg.get("enable_async", False),
+                "SPECEDGE_DECODING_MODE": decoding_mode,
+                "SPECEDGE_DASD_ENABLE_ASYNC": effective_enable_async,
                 "SPECEDGE_DASD_START_WINDOW": dasd_cfg.get("start_window", 4),
                 "SPECEDGE_DASD_W_MIN": dasd_cfg.get("W_min", 4),
                 "SPECEDGE_DASD_W_MAX": dasd_cfg.get("W_max", max_budget),
@@ -140,15 +176,9 @@ def main(config_file: str):
                 "SPECEDGE_DASD_ROLLBACK_AVOID_FAILED_TOKEN": dasd_cfg.get(
                     "rollback_avoid_failed_token", False
                 ),
-                "SPECEDGE_DASD_ADAPTIVE_CREDIT_ENABLED": dasd_cfg.get(
-                    "adaptive_credit_enabled", False
-                ),
-                "SPECEDGE_DASD_ADAPTIVE_WINDOW_ENABLED": dasd_cfg.get(
-                    "adaptive_window_enabled", False
-                ),
-                "SPECEDGE_DASD_ADAPTIVE_TREE_BUDGET_ENABLED": dasd_cfg.get(
-                    "adaptive_tree_budget_enabled", False
-                ),
+                "SPECEDGE_DASD_ADAPTIVE_CREDIT_ENABLED": adaptive_credit_enabled,
+                "SPECEDGE_DASD_ADAPTIVE_WINDOW_ENABLED": adaptive_window_enabled,
+                "SPECEDGE_DASD_ADAPTIVE_TREE_BUDGET_ENABLED": adaptive_tree_budget_enabled,
                 "SPECEDGE_DASD_CREDIT_MIN": dasd_cfg.get("credit_min", 0),
                 "SPECEDGE_DASD_CREDIT_MAX": dasd_cfg.get(
                     "credit_max", max(max_budget, dasd_cfg.get("W_max", max_budget))

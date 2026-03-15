@@ -102,6 +102,9 @@ class DasdCreditController:
             elif proposed_len > 0 and accepted_len == proposed_len:
                 unclamped_credit += float(self.success_bonus)
 
+            if proposed_len > 0 and accepted_len == 0:
+                unclamped_credit = min(float(self.credit), unclamped_credit)
+
             self.credit = max(
                 self.credit_min,
                 min(self.credit_max, int(round(unclamped_credit))),
@@ -179,6 +182,23 @@ class DasdCreditController:
             max_budget=max_budget,
             max_n_beams=max(1, min(fallback_max_n_beams, max_budget)),
             max_branch_width=max(1, min(fallback_max_branch_width, max_budget)),
+        )
+
+    def current_inflight_cap(self, fallback: int):
+        if not self.adaptive_enabled:
+            return fallback
+        return max(
+            1,
+            min(
+                fallback,
+                self._map_range(
+                    self.credit,
+                    self.credit_min,
+                    self.credit_max,
+                    1,
+                    fallback,
+                ),
+            ),
         )
 
     def _map_range(

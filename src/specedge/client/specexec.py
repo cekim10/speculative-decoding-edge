@@ -61,7 +61,15 @@ class SpecExecClient:
 
         self._max_new_tokens = config.max_new_tokens
         self._client_idx = config.client_idx
-        self._mode = config.mode
+        self._decoding_mode = getattr(config, "decoding_mode", config.mode)
+        self._mode = (
+            "dasd"
+            if self._decoding_mode in {
+                "async_speculative_homogeneous",
+                "async_credit_heterogeneous",
+            }
+            else "specedge"
+        )
         self._dasd_enabled = self._mode == "dasd" and config.dasd_enable_async
         self._dasd_client_id = f"{config.process_name}@{socket.gethostname()}"
         self._dasd_server_poisoned = False
@@ -403,6 +411,11 @@ class SpecExecClient:
 
     def _current_dasd_inflight_cap(self, state: DasdRequestState):
         conservative_mode = self._update_pipeline_mode(state)
+        credit_cap = (
+            state.credit_controller.current_inflight_cap(config.dasd_max_inflight_bundles)
+            if state.credit_controller is not None
+            else config.dasd_max_inflight_bundles
+        )
         if state.frontier_sync_active:
             state.frontier_sync_inflight_cap_hits += 1
             self._log_dasd_state_event(
@@ -415,9 +428,22 @@ class SpecExecClient:
                 inflight_cap=1,
             )
             return 1
-        instability_window_cap = self._instability_window_cap(state)
-        if instability_window_cap is not None:
-            effective_cap = max(1, min(config.dasd_max_inflight_bundles, instability_window_cap))
+        instability_inflight_cap = self._instability_inflight_cap(state)
+        if conservative_mode:
+            effective_cap = 1
+            if instability_inflight_cap is not None:
+                effective_cap = min(effective_cap, instability_inflight_cap)
+            state.instability_growth_clamp_count += 1
+            self._log_dasd_state_event(
+                "conservative_pipeline_mode",
+                state,
+                decision_reason="conservative_single_frontier",
+                base_token_index=state.committed_len,
+                inflight_cap=effective_cap,
+            )
+            return effective_cap
+        if instability_inflight_cap is not None:
+            effective_cap = max(1, min(credit_cap, instability_inflight_cap))
             state.instability_growth_clamp_count += 1
             self._log_dasd_state_event(
                 "effective_controller_caps",
@@ -425,20 +451,11 @@ class SpecExecClient:
                 decision_reason="instability_growth_cap",
                 base_token_index=state.committed_len,
                 inflight_cap=effective_cap,
-                window_cap=instability_window_cap,
+                credit_cap=credit_cap,
+                instability_inflight_cap=instability_inflight_cap,
             )
             return effective_cap
-        if conservative_mode:
-            state.unstable_phase_inflight_cap_hits += 1
-            self._log_dasd_state_event(
-                "unstable_inflight_cap_applied",
-                state,
-                decision_reason="unstable_phase",
-                base_token_index=state.committed_len,
-                inflight_cap=1,
-            )
-            return 1
-        return config.dasd_max_inflight_bundles
+        return max(1, credit_cap)
 
     def _enter_local_stabilization(self, state: DasdRequestState, reason: str):
         if state.local_stabilization_active:
@@ -621,6 +638,21 @@ class SpecExecClient:
         cap = None
         if state.hard_stabilization_active:
             cap = 2
+        if state.local_stabilization_active or state.recovery_mode_active:
+            cap = 2 if cap is None else min(cap, 2)
+        if state.cooldown_active:
+            cap = 2 if cap is None else min(cap, 2)
+        if state.instability_credit_clamp_active:
+            clamp_cap = 1 if state.last_rollback_distance > 32 else 2
+            cap = clamp_cap if cap is None else min(cap, clamp_cap)
+        return cap
+
+    def _instability_inflight_cap(self, state: DasdRequestState):
+        cap = None
+        if state.hard_stabilization_active:
+            cap = 2
+        if state.local_stabilization_active or state.recovery_mode_active:
+            cap = 1 if cap is None else min(cap, 1)
         if state.cooldown_active:
             cap = 2 if cap is None else min(cap, 2)
         if state.instability_credit_clamp_active:
@@ -631,11 +663,16 @@ class SpecExecClient:
     def _instability_tree_budget_cap(self, state: DasdRequestState):
         if not (
             state.hard_stabilization_active
+            or state.local_stabilization_active
+            or state.recovery_mode_active
             or state.cooldown_active
             or state.instability_credit_clamp_active
         ):
             return None
-        max_depth = 1 if state.instability_credit_clamp_active else 2
+        max_depth = 1 if (
+            state.instability_credit_clamp_active
+            or state.recovery_mode_active
+        ) else 2
         return DasdTreeBudget(
             max_beam_len=max(1, min(self._fixed_max_beam_len, max_depth)),
             max_budget=max(2, min(self._fixed_max_budget, 4)),
@@ -2765,6 +2802,15 @@ class SpecExecClient:
     def _verify_configs(self):
         if self._proactive_type not in ["included", "excluded", "disabled"]:
             raise ValueError(f"Invalid proactive_type: {self._proactive_type}")
+        if self._decoding_mode not in [
+            "autoregressive",
+            "sync_speculative",
+            "async_speculative_homogeneous",
+            "async_credit_heterogeneous",
+            "specedge",
+            "dasd",
+        ]:
+            raise ValueError(f"Invalid decoding_mode: {self._decoding_mode}")
         if self._mode not in ["specedge", "dasd"]:
             raise ValueError(f"Invalid mode: {self._mode}")
 
@@ -2772,6 +2818,12 @@ class SpecExecClient:
         """
         Generate a sequence using SpecExec up to max_new_tokens.
         """
+        self._logger.info(
+            "Decoding mode=%s drafter_model=%s dasd_enabled=%s",
+            self._decoding_mode,
+            config.draft_model,
+            self._dasd_enabled,
+        )
 
         if self._dasd_enabled:
             try:
@@ -3252,6 +3304,13 @@ class SpecExecClient:
                     if state.credit_controller is not None
                     else None
                 ),
+                "final_acceptance_ratio": (
+                    state.total_accepted_tokens / state.total_verified_tokens
+                    if state.total_verified_tokens > 0
+                    else 0.0
+                ),
+                "drafter_model": config.draft_model,
+                "decoding_mode": self._decoding_mode,
                 "final_status": state.finish_status,
                 "adaptive_window_enabled": config.dasd_adaptive_window_enabled,
                 "adaptive_tree_budget_enabled": config.dasd_adaptive_tree_budget_enabled,
@@ -3332,9 +3391,6 @@ class SpecExecClient:
             )
 
         if state.local_stabilization_active or state.cooldown_active:
-            conservative_budget = self._conservative_dasd_tree_budget()
-            state.window_size = max(1, min(state.window_size, config.dasd_recovery_forced_w))
-            state.tree_budget = conservative_budget
             self._log_dasd_state_event(
                 "mitigation_decision",
                 state,
@@ -3347,18 +3403,15 @@ class SpecExecClient:
             )
 
         if state.recovery_mode_active and config.dasd_recovery_mode_enabled:
-            state.window_size = max(1, config.dasd_recovery_forced_w)
-            state.tree_budget = self._conservative_dasd_tree_budget()
             if config.dasd_debug:
                 self._logger.info(
-                    "[DASD] recovery_mode_active req=%s epoch=%d committed=%d reason=%s rounds_left=%d forced_W=%d forced_tree=%s",
+                    "[DASD] recovery_mode_active req=%s epoch=%d committed=%d reason=%s rounds_left=%d credit=%s",
                     state.request_id,
                     state.epoch,
                     state.committed_len,
                     state.recovery_mode_reason,
                     state.recovery_mode_rounds_left,
-                    state.window_size,
-                    state.tree_budget,
+                    state.credit_controller.credit if state.credit_controller is not None else None,
                 )
 
         instability_window_cap = self._instability_window_cap(state)
@@ -3407,6 +3460,15 @@ class SpecExecClient:
                 "max_window": config.dasd_max_window,
                 "chosen_window": state.window_size,
                 "server_next_credit": next_credit,
+            }
+            feedback["inflight_mapping"] = {
+                "credit": state.credit_controller.credit,
+                "chosen_inflight_cap": (
+                    state.credit_controller.current_inflight_cap(
+                        config.dasd_max_inflight_bundles
+                    )
+                ),
+                "max_inflight_bundles": config.dasd_max_inflight_bundles,
             }
             feedback["tree_mapping"] = {
                 "adaptive_tree_budget_enabled": (
@@ -4198,6 +4260,18 @@ class SpecExecClient:
                 if state.frontier_sync_active:
                     break
             elif send_reason == "low_value_retry_suppressed":
+                if (
+                    phase == "normal_refill"
+                    and not self._should_use_conservative_single_frontier_mode(state)
+                ):
+                    last_reason = "healthy_path_retry_suppressed"
+                    self._log_refill_decision(
+                        state,
+                        phase=phase,
+                        action="no_work",
+                        reason=last_reason,
+                    )
+                    break
                 base_token_index = state.next_base_index
                 current_candidate = state.drafted_tokens[
                     base_token_index : base_token_index + state.window_size
@@ -4918,6 +4992,11 @@ class SpecExecClient:
                     "leaf_budget_at_send": task_info.leaf_budget_at_send,
                     "branch_width_at_send": task_info.branch_width_at_send,
                     "accepted_len": accepted_len,
+                    "acceptance_ratio": (
+                        float(accepted_len) / float(verified_len)
+                        if verified_len > 0
+                        else 0.0
+                    ),
                     "r_obs": float(result.response.r_obs),
                     "next_credit": next_credit,
                     "verifier_next_token_id": verifier_next_token_id,
@@ -4965,6 +5044,8 @@ class SpecExecClient:
                     "server_service_ms": float(result.response.server_service_ms),
                     "reject_reason": reject_reason,
                     "verifier_poisoned": verifier_poisoned,
+                    "drafter_model": config.draft_model,
+                    "decoding_mode": self._decoding_mode,
                     "mode": "dasd",
                 }
             )

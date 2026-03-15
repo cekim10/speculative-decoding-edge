@@ -131,6 +131,12 @@ class SpecEdgeClientConfig(metaclass=_ConfigMeta):
         cls.client_idx = int(cls._from_env("SPECEDGE_CLIENT_IDX"))
 
         # DASD configuration (optional)
+        cls.decoding_mode = os.getenv(
+            "SPECEDGE_DECODING_MODE",
+            "async_credit_heterogeneous"
+            if os.getenv("SPECEDGE_MODE", "specedge") == "dasd"
+            else "sync_speculative",
+        )
         cls.mode = os.getenv("SPECEDGE_MODE", "specedge")
         cls.dasd_enable_async = os.getenv("SPECEDGE_DASD_ENABLE_ASYNC", "False") == "True"
         cls.dasd_start_window = int(os.getenv("SPECEDGE_DASD_START_WINDOW", "4"))
@@ -353,6 +359,12 @@ class SpecEdgeBatchServerConfig(metaclass=_ConfigMeta):
         cls.cache_prefill = cls._from_env("SPECEDGE_CACHE_PREFILL") == "True"
 
         # DASD mode configuration (optional; defaults preserve baseline behavior)
+        cls.decoding_mode = os.getenv(
+            "SPECEDGE_DECODING_MODE",
+            "async_credit_heterogeneous"
+            if os.getenv("SPECEDGE_MODE", "specedge") == "dasd"
+            else "sync_speculative",
+        )
         cls.mode = os.getenv("SPECEDGE_MODE", "specedge")
         cls.dasd_enable_async = os.getenv("SPECEDGE_DASD_ENABLE_ASYNC", "False") == "True"
         cls.dasd_w_min = int(os.getenv("SPECEDGE_DASD_W_MIN", "4"))

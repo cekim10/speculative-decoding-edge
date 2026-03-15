@@ -1203,6 +1203,81 @@ class SpecExecClient:
         state.suffix_refresh_last_failure_family_identity = None
         state.last_suffix_refresh_family_reason = ""
 
+    def _reset_same_base_rollback_family_state(
+        self,
+        state: DasdRequestState,
+        reason: str,
+        *,
+        clear_reopen_block: bool = True,
+    ):
+        state.same_base_rollback_family_identity = None
+        state.same_base_rollback_family_zero_accept_count = 0
+        state.same_base_rollback_closed_family_identity = None
+        state.same_base_rollback_closed_blocked_tokens = None
+        if clear_reopen_block:
+            state.same_base_rollback_reopen_block_prefix_key = None
+        state.last_same_base_rollback_reason = reason
+
+    def _same_base_rollback_family_key(
+        self,
+        state: DasdRequestState,
+        verifier_next_token_id: int,
+    ):
+        return (
+            self._dasd_prefix_key(state),
+            int(verifier_next_token_id),
+        )
+
+    def _same_base_rollback_closed_prefix_key(self, state: DasdRequestState):
+        closed_identity = state.same_base_rollback_closed_family_identity
+        if closed_identity is None:
+            return None
+        return closed_identity[0]
+
+    def _record_same_base_rollback_family(
+        self,
+        state: DasdRequestState,
+        *,
+        verifier_next_token_id: int,
+        reason: str,
+    ):
+        family_identity = self._same_base_rollback_family_key(
+            state,
+            verifier_next_token_id,
+        )
+        blocked_tokens = tuple(sorted(self._compute_blocked_tokens_for_prefix(state)))
+        if state.same_base_rollback_family_identity == family_identity:
+            state.same_base_rollback_family_zero_accept_count += 1
+        else:
+            state.same_base_rollback_family_identity = family_identity
+            state.same_base_rollback_family_zero_accept_count = 1
+        state.last_same_base_rollback_reason = reason
+        newly_closed = False
+        if state.same_base_rollback_family_zero_accept_count >= 2:
+            if state.same_base_rollback_closed_family_identity != family_identity:
+                state.same_base_rollback_family_close_count += 1
+                newly_closed = True
+            state.same_base_rollback_closed_family_identity = family_identity
+            state.same_base_rollback_closed_blocked_tokens = blocked_tokens
+        return (
+            family_identity,
+            state.same_base_rollback_family_zero_accept_count,
+            newly_closed,
+        )
+
+    def _arm_same_base_rollback_reopen_block(
+        self,
+        state: DasdRequestState,
+        reason: str,
+    ):
+        self._reset_same_base_rollback_family_state(
+            state,
+            reason=reason,
+            clear_reopen_block=False,
+        )
+        state.same_base_rollback_reopen_block_prefix_key = self._dasd_prefix_key(state)
+        state.last_same_base_rollback_reason = reason
+
     def _suffix_refresh_anchor_key(self, state: DasdRequestState):
         return (
             self._dasd_prefix_key(state),
@@ -2661,6 +2736,23 @@ class SpecExecClient:
     ):
         if base_token_index != state.committed_len:
             return False, ""
+        current_prefix_key = self._dasd_prefix_key(state)
+        if (
+            self._same_base_rollback_closed_prefix_key(state) == current_prefix_key
+            and max(0, config.dasd_recovery_fallback_decode_steps) > 0
+        ):
+            state.same_base_rollback_guard_skip_count += 1
+            state.same_base_rollback_fast_path_count += 1
+            state.last_same_base_rollback_reason = "same_base_dead_family"
+            return True, "same_base_dead_family"
+        if (
+            state.same_base_rollback_reopen_block_prefix_key == current_prefix_key
+            and max(0, config.dasd_recovery_fallback_decode_steps) > 0
+        ):
+            state.same_base_rollback_reopen_guard_skip_count += 1
+            state.same_base_rollback_fast_path_count += 1
+            state.last_same_base_rollback_reason = "forced_commit_reopen_blocked"
+            return True, "forced_commit_reopen_blocked"
         if state.base_retry_counts.get(base_token_index, 0) <= 1:
             return False, ""
         blocked_tokens = self._blocked_tokens_for_prefix(state)
@@ -2686,6 +2778,10 @@ class SpecExecClient:
         if rollback_cause == "rollback_due_to_contiguous_commit_mismatch":
             return False
         retry_count = state.base_retry_counts.get(base_token_index, 0)
+        if self._same_base_rollback_closed_prefix_key(state) == self._dasd_prefix_key(
+            state
+        ):
+            return False
         if state.suffix_refresh_closed_family_identity == (
             self._current_suffix_refresh_family_identity(state)
         ):
@@ -3431,6 +3527,12 @@ class SpecExecClient:
                 "suppressed_retry_loop_count": state.suppressed_retry_loop_count,
                 "suppressed_retry_loop_break_count": state.suppressed_retry_loop_break_count,
                 "suppressed_retry_loop_escalation_count": state.suppressed_retry_loop_escalation_count,
+                "same_base_rollback_family_close_count": state.same_base_rollback_family_close_count,
+                "same_base_rollback_guard_skip_count": state.same_base_rollback_guard_skip_count,
+                "same_base_rollback_reopen_guard_skip_count": state.same_base_rollback_reopen_guard_skip_count,
+                "same_base_rollback_fast_path_count": state.same_base_rollback_fast_path_count,
+                "same_base_rollback_closed_family_identity": state.same_base_rollback_closed_family_identity,
+                "same_base_rollback_reopen_block_prefix_key": state.same_base_rollback_reopen_block_prefix_key,
                 "suffix_refresh_guard_skip_count": state.suffix_refresh_guard_skip_count,
                 "suffix_refresh_closed_family_identity": state.suffix_refresh_closed_family_identity,
                 "suffix_refresh_last_attempt_family_identity": state.suffix_refresh_last_attempt_family_identity,
@@ -3438,6 +3540,7 @@ class SpecExecClient:
                 "tiny_rebuild_guard_skip_count": state.tiny_rebuild_guard_skip_count,
                 "conservative_forward_entry_count": state.conservative_forward_entry_count,
                 "last_suppressed_retry_reason": state.last_suppressed_retry_reason,
+                "last_same_base_rollback_reason": state.last_same_base_rollback_reason,
                 "last_rollback_cause": state.last_rollback_cause,
                 "last_retry_decision_reason": state.last_retry_decision_reason,
                 "last_recovery_mode_transition_reason": state.last_recovery_mode_transition_reason,
@@ -4089,6 +4192,10 @@ class SpecExecClient:
         state.committed_len += 1
         state.next_base_index = state.committed_len
         self._clear_suffix_refresh_anchor(state)
+        self._reset_same_base_rollback_family_state(
+            state,
+            reason="fallback_burst_progress",
+        )
         self._reset_suppressed_retry_loop_state(state, reason="fallback_burst_progress")
         self._reset_alternative_frontier_search_state(
             state, reason="fallback_burst_progress"
@@ -4154,11 +4261,27 @@ class SpecExecClient:
         if int(getattr(response, "verifier_next_token_id", 0)) < 0:
             state.last_forced_commit_decision_reason = "missing_verifier_token"
             return False
+        dead_family_identity = self._same_base_rollback_family_key(
+            state,
+            int(getattr(response, "verifier_next_token_id", 0)),
+        )
         if state.forced_commits_by_base.get(base_token_index, 0) >= max(
             1, config.dasd_recovery_forced_commit_max_per_base
         ):
             state.last_forced_commit_decision_reason = "max_per_base_reached"
             return False
+        if state.same_base_rollback_closed_family_identity == dead_family_identity:
+            state.last_forced_commit_decision_reason = "same_base_dead_family"
+            self._log_dasd_state_event(
+                "forced_commit_decision",
+                state,
+                decision_reason=state.last_forced_commit_decision_reason,
+                base_token_index=base_token_index,
+                forced_commit_eligible=True,
+                verifier_next_token_id=int(getattr(response, "verifier_next_token_id", -1)),
+                rollback_family_identity=dead_family_identity,
+            )
+            return True
         same_base_retries = state.base_retry_counts.get(base_token_index, 0)
         if (
             same_base_retries
@@ -4261,6 +4384,10 @@ class SpecExecClient:
         state.committed_len += 1
         state.next_base_index = state.committed_len
         self._clear_suffix_refresh_anchor(state)
+        self._arm_same_base_rollback_reopen_block(
+            state,
+            reason="forced_commit_progress",
+        )
         self._reset_suppressed_retry_loop_state(state, reason="forced_commit_progress")
         self._reset_alternative_frontier_search_state(
             state, reason="forced_commit_progress"
@@ -4687,7 +4814,11 @@ class SpecExecClient:
         )
         relaxed_suppression = False
         if short_circuit_retry:
-            if self._should_relax_recovery_resend_suppression(
+            allow_relaxed_suppression = retry_quality_reason not in {
+                "same_base_dead_family",
+                "forced_commit_reopen_blocked",
+            }
+            if allow_relaxed_suppression and self._should_relax_recovery_resend_suppression(
                 state,
                 base_token_index=base_token_index,
                 token_ids=token_ids,
@@ -4724,6 +4855,8 @@ class SpecExecClient:
                     base_token_index=base_token_index,
                     fingerprint_attempts=fingerprint_attempts,
                     unique_retry_fingerprints=unique_fingerprints,
+                    rollback_family_identity=state.same_base_rollback_closed_family_identity,
+                    rollback_reopen_prefix_key=state.same_base_rollback_reopen_block_prefix_key,
                 )
                 return False, "low_value_retry_suppressed"
         if relaxed_suppression:
@@ -5043,6 +5176,10 @@ class SpecExecClient:
             state.committed_len += accepted_len
             if accepted_len > 0:
                 self._clear_suffix_refresh_anchor(state)
+                self._reset_same_base_rollback_family_state(
+                    state,
+                    reason="committed_progress",
+                )
                 self._reset_suppressed_retry_loop_state(state, reason="committed_progress")
                 self._reset_alternative_frontier_search_state(
                     state, reason="committed_progress"
@@ -5081,6 +5218,39 @@ class SpecExecClient:
                     state.per_base_max_full_rejection_count,
                     lifecycle["full_rejections"],
                 )
+                (
+                    rollback_family_identity,
+                    rollback_family_zero_accept_count,
+                    rollback_family_newly_closed,
+                ) = self._record_same_base_rollback_family(
+                    state,
+                    verifier_next_token_id=verifier_next_token_id,
+                    reason="full_rejection",
+                )
+                if rollback_family_newly_closed:
+                    state.same_base_rollback_fast_path_count += 1
+                    self._enter_fallback_burst(
+                        state,
+                        reason="same_base_dead_family",
+                    )
+                    self._enter_frontier_sync(
+                        state,
+                        reason="same_base_dead_family",
+                    )
+                    self._enter_hard_stabilization(
+                        state,
+                        reason="same_base_dead_family",
+                    )
+                    self._log_dasd_state_event(
+                        "same_base_rollback_family_closed",
+                        state,
+                        decision_reason="full_rejection",
+                        base_token_index=prev_committed,
+                        verifier_next_token_id=verifier_next_token_id,
+                        rollback_family_identity=rollback_family_identity,
+                        zero_accept_repeats=rollback_family_zero_accept_count,
+                        blocked_tokens=state.same_base_rollback_closed_blocked_tokens,
+                    )
             else:
                 state.consecutive_full_rejections = 0
             state.max_full_rejection_streak = max(

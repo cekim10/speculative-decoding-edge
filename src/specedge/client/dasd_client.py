@@ -503,6 +503,16 @@ class DasdRequestState:
     suppressed_retry_last_fingerprint: tuple[int, ...] | None = None
     suppressed_retry_last_blocked_tokens: tuple[int, ...] | None = None
     last_suppressed_retry_reason: str = ""
+    same_base_rollback_family_identity: Any | None = None
+    same_base_rollback_family_zero_accept_count: int = 0
+    same_base_rollback_closed_family_identity: Any | None = None
+    same_base_rollback_closed_blocked_tokens: tuple[int, ...] | None = None
+    same_base_rollback_reopen_block_prefix_key: Any | None = None
+    same_base_rollback_family_close_count: int = 0
+    same_base_rollback_guard_skip_count: int = 0
+    same_base_rollback_reopen_guard_skip_count: int = 0
+    same_base_rollback_fast_path_count: int = 0
+    last_same_base_rollback_reason: str = ""
     suffix_refresh_anchor_frontier_key: Any | None = None
     suffix_refresh_closed_family_identity: Any | None = None
     suffix_refresh_last_attempt_identity: Any | None = None

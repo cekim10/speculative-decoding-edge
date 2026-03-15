@@ -504,9 +504,12 @@ class DasdRequestState:
     suppressed_retry_last_blocked_tokens: tuple[int, ...] | None = None
     last_suppressed_retry_reason: str = ""
     suffix_refresh_anchor_frontier_key: Any | None = None
+    suffix_refresh_closed_family_identity: Any | None = None
     suffix_refresh_last_attempt_identity: Any | None = None
+    suffix_refresh_last_attempt_family_identity: Any | None = None
     suffix_refresh_last_failure_identity: Any | None = None
-    tiny_rebuild_last_attempt_key: tuple[int, int] | None = None
+    suffix_refresh_last_failure_family_identity: Any | None = None
+    tiny_rebuild_last_attempt_key: Any | None = None
     suffix_refresh_guard_skip_count: int = 0
     tiny_rebuild_guard_skip_count: int = 0
     conservative_forward_entry_count: int = 0
@@ -523,6 +526,7 @@ class DasdRequestState:
     last_forced_commit_decision_reason: str = ""
     last_mitigation_decision_reason: str = ""
     last_suffix_refresh_reason: str = ""
+    last_suffix_refresh_family_reason: str = ""
     last_cooldown_reason: str = ""
     last_retry_quality_reason: str = ""
     last_frontier_sync_reason: str = ""

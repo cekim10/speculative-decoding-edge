@@ -1196,14 +1196,24 @@ class SpecExecClient:
     def _clear_suffix_refresh_anchor(self, state: DasdRequestState):
         state.suffix_refresh_anchor_committed_len = None
         state.suffix_refresh_anchor_frontier_key = None
+        state.suffix_refresh_closed_family_identity = None
         state.suffix_refresh_last_attempt_identity = None
+        state.suffix_refresh_last_attempt_family_identity = None
         state.suffix_refresh_last_failure_identity = None
+        state.suffix_refresh_last_failure_family_identity = None
+        state.last_suffix_refresh_family_reason = ""
 
     def _suffix_refresh_anchor_key(self, state: DasdRequestState):
         return (
             self._dasd_prefix_key(state),
             tuple(sorted(self._compute_blocked_tokens_for_prefix(state))),
         )
+
+    def _suffix_refresh_frontier_family_key(self, state: DasdRequestState):
+        # Family identity intentionally ignores the exact blocked-token set so
+        # blocked-token supersets stay in the same unstable frontier family
+        # until committed progress changes the prefix key.
+        return self._dasd_prefix_key(state)
 
     def _suffix_refresh_frontier_fingerprint(self, state: DasdRequestState):
         frontier_tokens = tuple(
@@ -1228,6 +1238,16 @@ class SpecExecClient:
             self._suffix_refresh_anchor_key(state),
             self._suffix_refresh_frontier_fingerprint(state),
         )
+
+    def _current_suffix_refresh_family_identity(self, state: DasdRequestState):
+        return self._suffix_refresh_frontier_family_key(state)
+
+    def _current_recovery_attempt_key(self, state: DasdRequestState):
+        # Tiny rebuild and adjacent recovery paths still guard repeated attempts
+        # on the current frontier identity; keep that key aligned with the
+        # suffix-refresh frontier identity so stale helper renames do not fork
+        # the recovery semantics.
+        return self._current_suffix_refresh_attempt_identity(state)
 
     def _enter_conservative_forward_progress(
         self,
@@ -2310,6 +2330,7 @@ class SpecExecClient:
     def _prepare_dasd_suffix_refresh_state(self, state: DasdRequestState, reason: str):
         anchor_committed_len = state.committed_len
         frontier_anchor_key = self._suffix_refresh_anchor_key(state)
+        frontier_family_key = self._current_suffix_refresh_family_identity(state)
         if state.suffix_refresh_anchor_frontier_key != frontier_anchor_key:
             self._log_dasd_state_event(
                 "suffix_refresh_anchor_miss",
@@ -2321,6 +2342,7 @@ class SpecExecClient:
                 current_epoch=state.epoch,
                 anchor_frontier_key=state.suffix_refresh_anchor_frontier_key,
                 current_frontier_key=frontier_anchor_key,
+                current_frontier_family_key=frontier_family_key,
                 truncating_rebuild_applied=True,
             )
             self._prepare_dasd_refill_from_committed(state, reason="suffix_refresh")
@@ -2339,6 +2361,7 @@ class SpecExecClient:
             current_committed_len=state.committed_len,
             current_epoch=state.epoch,
             anchor_frontier_key=state.suffix_refresh_anchor_frontier_key,
+            current_frontier_family_key=frontier_family_key,
             truncating_rebuild_applied=False,
         )
 
@@ -2468,14 +2491,29 @@ class SpecExecClient:
 
     def _perform_suffix_refresh(self, state: DasdRequestState, reason: str):
         attempt_identity = self._current_suffix_refresh_attempt_identity(state)
+        family_identity = self._current_suffix_refresh_family_identity(state)
+        if state.suffix_refresh_closed_family_identity == family_identity:
+            state.suffix_refresh_guard_skip_count += 1
+            state.suffix_refresh_last_failure_family_identity = family_identity
+            self._log_dasd_state_event(
+                "suffix_refresh_fail",
+                state,
+                decision_reason="suffix_refresh_closed_family_suppressed",
+                base_token_index=state.committed_len,
+                frontier_identity=attempt_identity,
+                frontier_family_identity=family_identity,
+            )
+            return False, "suffix_refresh_closed_family_suppressed"
         if state.suffix_refresh_last_failure_identity == attempt_identity:
             state.suffix_refresh_guard_skip_count += 1
+            state.suffix_refresh_last_failure_family_identity = family_identity
             self._log_dasd_state_event(
                 "suffix_refresh_fail",
                 state,
                 decision_reason="suffix_refresh_failed_frontier_suppressed",
                 base_token_index=state.committed_len,
                 frontier_identity=attempt_identity,
+                frontier_family_identity=family_identity,
             )
             return False, "suffix_refresh_failed_frontier_suppressed"
         if state.suffix_refresh_last_attempt_identity == attempt_identity:
@@ -2486,11 +2524,14 @@ class SpecExecClient:
                 decision_reason="suffix_refresh_same_frontier_suppressed",
                 base_token_index=state.committed_len,
                 frontier_identity=attempt_identity,
+                frontier_family_identity=family_identity,
             )
             return False, "suffix_refresh_same_frontier_suppressed"
         state.suffix_refresh_last_attempt_identity = attempt_identity
+        state.suffix_refresh_last_attempt_family_identity = family_identity
         state.suffix_refresh_attempt_count += 1
         state.last_suffix_refresh_reason = reason
+        state.last_suffix_refresh_family_reason = reason
         state.last_mitigation_decision_reason = reason
         self._refresh_dasd_control_targets(
             state,
@@ -2502,6 +2543,8 @@ class SpecExecClient:
             state,
             decision_reason=reason,
             base_token_index=state.committed_len,
+            frontier_identity=attempt_identity,
+            frontier_family_identity=family_identity,
         )
         self._prepare_dasd_suffix_refresh_state(state, reason=reason)
         regenerated, regen_reason = self._regenerate_dasd_suffix(
@@ -2542,23 +2585,28 @@ class SpecExecClient:
             if not sendable_after_refresh:
                 state.suffix_refresh_fail_count += 1
                 state.suffix_refresh_last_failure_identity = attempt_identity
+                state.suffix_refresh_last_failure_family_identity = family_identity
                 self._log_dasd_state_event(
                     "suffix_refresh_end",
                     state,
                     decision_reason=frontier_reason,
                     base_token_index=state.committed_len,
+                    frontier_family_identity=family_identity,
                 )
                 self._log_dasd_state_event(
                     "suffix_refresh_fail",
                     state,
                     decision_reason=frontier_reason,
                     base_token_index=state.committed_len,
+                    frontier_identity=attempt_identity,
+                    frontier_family_identity=family_identity,
                 )
                 return False, frontier_reason
             state.suffix_refresh_success_count += 1
             state.rollback_cleanup_avoided_count += 1
             state.cheap_recovery_success_count += 1
             state.suffix_refresh_last_failure_identity = None
+            state.suffix_refresh_last_failure_family_identity = None
             self._enter_hard_stabilization(state, reason="suffix_refresh_success")
             self._exit_local_stabilization(
                 state,
@@ -2572,28 +2620,35 @@ class SpecExecClient:
                 state,
                 decision_reason="success",
                 base_token_index=state.committed_len,
+                frontier_family_identity=family_identity,
             )
             self._log_dasd_state_event(
                 "suffix_refresh_success",
                 state,
                 decision_reason=reason,
                 base_token_index=state.committed_len,
+                frontier_identity=attempt_identity,
+                frontier_family_identity=family_identity,
             )
             self._enter_cooldown(state, reason="suffix_refresh_success")
             return True, "suffix_refresh_success"
         state.suffix_refresh_fail_count += 1
         state.suffix_refresh_last_failure_identity = attempt_identity
+        state.suffix_refresh_last_failure_family_identity = family_identity
         self._log_dasd_state_event(
             "suffix_refresh_end",
             state,
             decision_reason=regen_reason,
             base_token_index=state.committed_len,
+            frontier_family_identity=family_identity,
         )
         self._log_dasd_state_event(
             "suffix_refresh_fail",
             state,
             decision_reason=regen_reason,
             base_token_index=state.committed_len,
+            frontier_identity=attempt_identity,
+            frontier_family_identity=family_identity,
         )
         return False, regen_reason
 
@@ -2631,6 +2686,10 @@ class SpecExecClient:
         if rollback_cause == "rollback_due_to_contiguous_commit_mismatch":
             return False
         retry_count = state.base_retry_counts.get(base_token_index, 0)
+        if state.suffix_refresh_closed_family_identity == (
+            self._current_suffix_refresh_family_identity(state)
+        ):
+            return False
         if state.suffix_refresh_anchor_frontier_key == self._suffix_refresh_anchor_key(
             state
         ):
@@ -3373,6 +3432,9 @@ class SpecExecClient:
                 "suppressed_retry_loop_break_count": state.suppressed_retry_loop_break_count,
                 "suppressed_retry_loop_escalation_count": state.suppressed_retry_loop_escalation_count,
                 "suffix_refresh_guard_skip_count": state.suffix_refresh_guard_skip_count,
+                "suffix_refresh_closed_family_identity": state.suffix_refresh_closed_family_identity,
+                "suffix_refresh_last_attempt_family_identity": state.suffix_refresh_last_attempt_family_identity,
+                "suffix_refresh_last_failure_family_identity": state.suffix_refresh_last_failure_family_identity,
                 "tiny_rebuild_guard_skip_count": state.tiny_rebuild_guard_skip_count,
                 "conservative_forward_entry_count": state.conservative_forward_entry_count,
                 "last_suppressed_retry_reason": state.last_suppressed_retry_reason,
@@ -3382,6 +3444,7 @@ class SpecExecClient:
                 "last_forced_commit_decision_reason": state.last_forced_commit_decision_reason,
                 "last_mitigation_decision_reason": state.last_mitigation_decision_reason,
                 "last_suffix_refresh_reason": state.last_suffix_refresh_reason,
+                "last_suffix_refresh_family_reason": state.last_suffix_refresh_family_reason,
                 "last_cooldown_reason": state.last_cooldown_reason,
                 "last_retry_quality_reason": state.last_retry_quality_reason,
                 "last_frontier_sync_reason": state.last_frontier_sync_reason,
@@ -5331,12 +5394,24 @@ class SpecExecClient:
                             base_token_index=prev_committed,
                         )
                         return
+                    state.suffix_refresh_closed_family_identity = (
+                        self._current_suffix_refresh_family_identity(state)
+                    )
+                    state.last_suffix_refresh_family_reason = refresh_reason
                     state.rollback_cleanup_escalated_count += 1
+                    self._log_dasd_state_event(
+                        "suffix_refresh_family_closed",
+                        state,
+                        decision_reason=refresh_reason,
+                        base_token_index=prev_committed,
+                        frontier_family_identity=state.suffix_refresh_closed_family_identity,
+                    )
                     self._log_dasd_state_event(
                         "rollback_cleanup_escalated",
                         state,
                         decision_reason=refresh_reason,
                         base_token_index=prev_committed,
+                        frontier_family_identity=state.suffix_refresh_closed_family_identity,
                     )
 
                 state.expensive_recovery_count += 1

@@ -41,6 +41,11 @@ class DasdCreditController:
     rtt_target_ms: float = 40.0
     rtt_gain: float = 0.75
     inflight_gain: float = 0.5
+    acceptance_weight: float = 1.0
+    instability_weight: float = 0.5
+    tau_high: float = 0.55
+    tau_low: float = 0.1
+    tau_critical: float = -0.35
     acceptance_ratio_ema: float = 1.0
     rtt_ema_ms: float = 0.0
     inflight_ema: float = 0.0
@@ -54,6 +59,8 @@ class DasdCreditController:
         *,
         rtt_ms: float = 0.0,
         inflight_count: int = 0,
+        rollback_distance: int = 0,
+        recovery_active: bool = False,
     ):
         credit_before = self.credit
         rejected_len = max(0, proposed_len - accepted_len)
@@ -61,13 +68,12 @@ class DasdCreditController:
         acceptance_ratio = (
             float(accepted_len) / float(proposed_len) if proposed_len > 0 else 0.0
         )
-        small_repair_round = proposed_len > 0 and proposed_len <= 2
         streak_before = {
             "strong_accept_streak": self.strong_accept_streak,
             "full_rejection_streak": self.full_rejection_streak,
         }
 
-        if proposed_len > 2 and accepted_len == proposed_len:
+        if proposed_len > 0 and accepted_len == proposed_len:
             self.strong_accept_streak += 1
             self.full_rejection_streak = 0
         elif accepted_len == 0 and proposed_len > 0:
@@ -79,38 +85,37 @@ class DasdCreditController:
 
         unclamped_credit = float(self.credit)
         controller_delta = 0
+        rtt_pressure = 0.0
+        instability_pressure = 0.0
+        health_score = 0.0
 
         if self.adaptive_enabled:
             self.acceptance_ratio_ema = 0.8 * self.acceptance_ratio_ema + 0.2 * acceptance_ratio
             self.rtt_ema_ms = 0.8 * self.rtt_ema_ms + 0.2 * max(0.0, float(rtt_ms))
             self.inflight_ema = 0.8 * self.inflight_ema + 0.2 * max(0, inflight_count)
-            rtt_pressure_ms = max(float(rtt_ms), self.rtt_ema_ms)
-            if proposed_len <= 0:
+            rtt_pressure = self._compute_rtt_pressure(float(rtt_ms))
+            instability_pressure = self._compute_instability_pressure(
+                acceptance_ratio=acceptance_ratio,
+                accepted_len=accepted_len,
+                proposed_len=proposed_len,
+                rollback_distance=rollback_distance,
+                recovery_active=recovery_active,
+            )
+            health_score = (
+                self.acceptance_weight * acceptance_ratio
+                - self.rtt_gain * rtt_pressure
+                - self.instability_weight * instability_pressure
+            )
+
+            if health_score > self.tau_high:
+                controller_delta = 1
+            elif health_score >= self.tau_low:
                 controller_delta = 0
-            elif accepted_len == 0:
-                controller_delta = -3
-            elif acceptance_ratio < 0.2:
-                controller_delta = -2
-            elif acceptance_ratio < 0.4:
+            elif health_score >= self.tau_critical:
                 controller_delta = -1
-            elif small_repair_round:
-                # W<=2 full accepts are repair proof, not evidence to reopen aggressively.
-                controller_delta = 0
-            elif acceptance_ratio >= 0.8:
-                controller_delta = 1
-            elif acceptance_ratio >= max(0.6, self.target_acceptance_ratio):
-                controller_delta = 1
+            else:
+                controller_delta = -2
 
-            if self.rtt_target_ms > 0:
-                if rtt_pressure_ms >= max(self.rtt_target_ms * 3.0, 180.0):
-                    if acceptance_ratio < 0.6:
-                        controller_delta -= 1
-                    else:
-                        controller_delta = min(controller_delta, 0)
-                elif rtt_pressure_ms >= max(self.rtt_target_ms * 2.0, 120.0):
-                    controller_delta = min(controller_delta, 0)
-
-            controller_delta = max(-3, min(1, controller_delta))
             unclamped_credit = float(self.credit) + float(controller_delta)
             if accepted_len == 0:
                 unclamped_credit = min(float(self.credit), unclamped_credit)
@@ -138,13 +143,51 @@ class DasdCreditController:
             "rtt_ema_ms": self.rtt_ema_ms,
             "inflight_count": inflight_count,
             "inflight_ema": self.inflight_ema,
+            "rollback_distance": rollback_distance,
+            "recovery_active": recovery_active,
+            "rtt_pressure": rtt_pressure,
+            "instability_pressure": instability_pressure,
+            "health_score": health_score,
             "controller_delta": controller_delta,
-            "small_repair_round": small_repair_round,
             "strong_accept_streak_before": streak_before["strong_accept_streak"],
             "full_rejection_streak_before": streak_before["full_rejection_streak"],
             "strong_accept_streak": self.strong_accept_streak,
             "full_rejection_streak": self.full_rejection_streak,
         }
+
+    def _compute_rtt_pressure(self, rtt_ms: float):
+        if self.rtt_target_ms <= 0:
+            return 0.0
+        return max(
+            0.0,
+            min(
+                2.0,
+                (max(0.0, rtt_ms) - self.rtt_target_ms)
+                / max(1.0, 2.0 * self.rtt_target_ms),
+            ),
+        )
+
+    def _compute_instability_pressure(
+        self,
+        *,
+        acceptance_ratio: float,
+        accepted_len: int,
+        proposed_len: int,
+        rollback_distance: int,
+        recovery_active: bool,
+    ):
+        pressure = 0.0
+        if proposed_len > 0 and accepted_len == 0:
+            pressure += 1.0
+        elif proposed_len > 0 and acceptance_ratio < 0.25:
+            pressure += 0.5
+        elif proposed_len > 0 and acceptance_ratio < 0.5:
+            pressure += 0.2
+        if rollback_distance > 0:
+            pressure += min(1.0, float(rollback_distance) / 16.0)
+        if recovery_active:
+            pressure += 1.1
+        return min(2.5, pressure)
 
     def current_window(self, fallback: int, effective_credit: Optional[int] = None):
         if not (self.adaptive_enabled and self.adaptive_window_enabled):

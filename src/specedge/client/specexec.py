@@ -562,6 +562,19 @@ class SpecExecClient:
             min(state.credit_controller.credit_max, effective_credit),
         )
 
+    def _dasd_recovery_active_for_credit(self, state: DasdRequestState):
+        return (
+            state.frontier_sync_active
+            or state.local_stabilization_active
+            or state.recovery_mode_active
+            or state.cooldown_active
+            or state.hard_stabilization_active
+            or state.instability_credit_clamp_active
+            or state.pipeline_resume_grace_active
+            or state.recovery_resend_relax_active
+            or state.fallback_burst_active
+        )
+
     def _enter_hard_stabilization(
         self,
         state: DasdRequestState,
@@ -3538,13 +3551,17 @@ class SpecExecClient:
 
         if config.dasd_debug:
             self._logger.info(
-                "[DASD] credit_control req=%s epoch=%d reason=%s adaptive=%s credit_before=%s raw_delta=%s controller_delta=%s unclamped=%s clamped=%s credit_after=%s accepted=%s proposed=%s rejected=%s strong_accept_streak=%s->%s full_rejection_streak=%s->%s W_before=%s W_after=%s window_mapping=%s tree_before=%s tree_after=%s tree_mapping=%s",
+                "[DASD] credit_control req=%s epoch=%d reason=%s adaptive=%s credit_before=%s raw_delta=%s health_score=%s rtt_pressure=%s instability_pressure=%s recovery_active=%s controller_delta=%s unclamped=%s clamped=%s credit_after=%s accepted=%s proposed=%s rejected=%s strong_accept_streak=%s->%s full_rejection_streak=%s->%s W_before=%s W_after=%s window_mapping=%s tree_before=%s tree_after=%s tree_mapping=%s",
                 state.request_id,
                 state.epoch,
                 reason,
                 feedback.get("adaptive_enabled") if feedback is not None else None,
                 feedback.get("credit_before") if feedback is not None else state.credit_controller.credit,
                 feedback.get("raw_delta") if feedback is not None else None,
+                feedback.get("health_score") if feedback is not None else None,
+                feedback.get("rtt_pressure") if feedback is not None else None,
+                feedback.get("instability_pressure") if feedback is not None else None,
+                feedback.get("recovery_active") if feedback is not None else None,
                 feedback.get("controller_delta") if feedback is not None else None,
                 feedback.get("unclamped_credit") if feedback is not None else None,
                 feedback.get("clamped_credit") if feedback is not None else None,
@@ -4886,6 +4903,12 @@ class SpecExecClient:
                     proposed_len=verified_len,
                     rtt_ms=rtt_ms,
                     inflight_count=len(state.inflight),
+                    rollback_distance=(
+                        state.last_rollback_distance
+                        if state.instability_credit_clamp_active
+                        else 0
+                    ),
+                    recovery_active=self._dasd_recovery_active_for_credit(state),
                 )
             self._refresh_dasd_control_targets(
                 state,
@@ -5068,6 +5091,26 @@ class SpecExecClient:
                     ),
                     "controller_delta": (
                         control_feedback.get("controller_delta")
+                        if control_feedback is not None
+                        else None
+                    ),
+                    "health_score": (
+                        control_feedback.get("health_score")
+                        if control_feedback is not None
+                        else None
+                    ),
+                    "rtt_pressure": (
+                        control_feedback.get("rtt_pressure")
+                        if control_feedback is not None
+                        else None
+                    ),
+                    "instability_pressure": (
+                        control_feedback.get("instability_pressure")
+                        if control_feedback is not None
+                        else None
+                    ),
+                    "recovery_active": (
+                        control_feedback.get("recovery_active")
                         if control_feedback is not None
                         else None
                     ),

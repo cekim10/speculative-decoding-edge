@@ -2436,6 +2436,15 @@ class SpecExecClient:
         if state.suffix_refresh_last_attempt_key == attempt_key:
             state.suffix_refresh_guard_skip_count += 1
             return False, "suffix_refresh_already_attempted"
+        if state.suffix_refresh_anchor_committed_len == state.committed_len:
+            state.suffix_refresh_guard_skip_count += 1
+            self._log_dasd_state_event(
+                "suffix_refresh_fail",
+                state,
+                decision_reason="suffix_refresh_same_frontier_suppressed",
+                base_token_index=state.committed_len,
+            )
+            return False, "suffix_refresh_same_frontier_suppressed"
         state.suffix_refresh_last_attempt_key = attempt_key
         state.suffix_refresh_attempt_count += 1
         state.last_suffix_refresh_reason = reason
@@ -2576,12 +2585,13 @@ class SpecExecClient:
         if rollback_cause == "rollback_due_to_contiguous_commit_mismatch":
             return False
         retry_count = state.base_retry_counts.get(base_token_index, 0)
-        defer_retry_limit = max(2, config.dasd_recovery_same_base_retry_threshold)
-        return (
-            state.local_stabilization_active
-            or state.recovery_mode_active
-            or retry_count <= defer_retry_limit
-        )
+        if state.suffix_refresh_anchor_committed_len == state.committed_len:
+            return False
+        if state.local_stabilization_active or state.recovery_mode_active:
+            return False
+        if state.instability_credit_clamp_active:
+            return False
+        return retry_count <= 1
 
     async def _attempt_dasd_refill_recovery(
         self,

@@ -193,6 +193,8 @@ class DasdCreditController:
         if not (self.adaptive_enabled and self.adaptive_window_enabled):
             return fallback
         credit = self.credit if effective_credit is None else effective_credit
+        if credit <= self.credit_min:
+            return 1
         return self._map_range(
             credit,
             self.credit_min,

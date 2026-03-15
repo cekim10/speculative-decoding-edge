@@ -503,7 +503,9 @@ class DasdRequestState:
     suppressed_retry_last_fingerprint: tuple[int, ...] | None = None
     suppressed_retry_last_blocked_tokens: tuple[int, ...] | None = None
     last_suppressed_retry_reason: str = ""
-    suffix_refresh_last_attempt_key: tuple[int, int] | None = None
+    suffix_refresh_anchor_frontier_key: Any | None = None
+    suffix_refresh_last_attempt_identity: Any | None = None
+    suffix_refresh_last_failure_identity: Any | None = None
     tiny_rebuild_last_attempt_key: tuple[int, int] | None = None
     suffix_refresh_guard_skip_count: int = 0
     tiny_rebuild_guard_skip_count: int = 0

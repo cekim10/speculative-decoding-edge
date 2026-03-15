@@ -37,7 +37,10 @@ def main(config_file: str):
     # client configuration
     host = config["client"]["host"]
     base_process_name = config["client"]["process_name"]
-    draft_model = config["client"]["draft_model"]
+    draft_model = config["client"].get(
+        "drafter_model",
+        config["client"].get("draft_model"),
+    )
     dataset = config["client"]["dataset"]
     max_n_beams = config["client"]["max_n_beams"]
     max_beam_len = config["client"]["max_beam_len"]
@@ -86,6 +89,10 @@ def main(config_file: str):
             if client_idx >= max_client_processes:
                 break
             device = client_info["device"]
+            client_drafter_model = client_info.get(
+                "drafter_model",
+                client_info.get("draft_model", draft_model),
+            )
 
             logger.info("Starting a client_%s on %s, %s", client_idx, node_name, device)
 
@@ -96,7 +103,8 @@ def main(config_file: str):
                 "SPECEDGE_PROCESS_NAME": f"{base_process_name}_{client_idx}",
                 "SPECEDGE_SEED": seed,
                 "SPECEDGE_MAX_LEN": max_len,
-                "SPECEDGE_DRAFT_MODEL": draft_model,
+                "SPECEDGE_DRAFT_MODEL": client_drafter_model,
+                "SPECEDGE_DRAFTER_MODEL": client_drafter_model,
                 "SPECEDGE_DEVICE": device,
                 "SPECEDGE_DTYPE": dtype,
                 "SPECEDGE_DATASET": dataset,

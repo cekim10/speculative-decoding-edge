@@ -19,9 +19,9 @@ class DasdTreeBudget:
 
 @dataclass
 class DasdCreditController:
-    # Research-friendly linear controller:
-    # credit increases with accepted tokens and decreases with rejected tokens,
-    # then maps to the next DASD window and draft-tree budget.
+    # Async DASD controller:
+    # credit tracks how deep the speculative pipeline should be given
+    # acceptance quality, verifier RTT, and current inflight overlap.
     adaptive_enabled: bool
     adaptive_window_enabled: bool
     adaptive_tree_budget_enabled: bool
@@ -36,13 +36,31 @@ class DasdCreditController:
     max_tree_depth: int
     min_leaf_budget: int
     max_leaf_budget: int
+    target_acceptance_ratio: float = 0.7
+    alpha: float = 2.0
+    rtt_target_ms: float = 40.0
+    rtt_gain: float = 0.75
+    inflight_gain: float = 0.5
+    acceptance_ratio_ema: float = 1.0
+    rtt_ema_ms: float = 0.0
+    inflight_ema: float = 0.0
     strong_accept_streak: int = 0
     full_rejection_streak: int = 0
 
-    def apply_feedback(self, accepted_len: int, proposed_len: int):
+    def apply_feedback(
+        self,
+        accepted_len: int,
+        proposed_len: int,
+        *,
+        rtt_ms: float = 0.0,
+        inflight_count: int = 0,
+    ):
         credit_before = self.credit
         rejected_len = max(0, proposed_len - accepted_len)
         raw_delta = accepted_len - rejected_len
+        acceptance_ratio = (
+            float(accepted_len) / float(proposed_len) if proposed_len > 0 else 0.0
+        )
         streak_before = {
             "strong_accept_streak": self.strong_accept_streak,
             "full_rejection_streak": self.full_rejection_streak,
@@ -61,16 +79,33 @@ class DasdCreditController:
         unclamped_credit = self.credit
 
         if self.adaptive_enabled:
-            unclamped_credit += raw_delta
+            self.acceptance_ratio_ema = 0.8 * self.acceptance_ratio_ema + 0.2 * acceptance_ratio
+            self.rtt_ema_ms = 0.8 * self.rtt_ema_ms + 0.2 * max(0.0, float(rtt_ms))
+            self.inflight_ema = 0.8 * self.inflight_ema + 0.2 * max(0, inflight_count)
 
-            if proposed_len > 0 and accepted_len == proposed_len:
-                unclamped_credit += self.success_bonus
-                if self.strong_accept_streak >= 2 and self.success_bonus > 0:
-                    unclamped_credit += 1
-            elif accepted_len == 0 and proposed_len > 0:
-                unclamped_credit -= self.rejection_penalty
+            acceptance_term = self.alpha * (
+                self.acceptance_ratio_ema - self.target_acceptance_ratio
+            )
+            rtt_term = 0.0
+            if self.rtt_target_ms > 0:
+                rtt_term = self.rtt_gain * max(
+                    0.0, (self.rtt_ema_ms - self.rtt_target_ms) / self.rtt_target_ms
+                )
+            inflight_gap = max(0.0, float(self.credit) - self.inflight_ema)
+            inflight_term = self.inflight_gain * min(
+                1.0,
+                inflight_gap / max(1.0, float(self.credit_max)),
+            )
+            unclamped_credit = float(self.credit) + acceptance_term + rtt_term + inflight_term
+            if proposed_len > 0 and accepted_len == 0:
+                unclamped_credit -= float(self.rejection_penalty)
+            elif proposed_len > 0 and accepted_len == proposed_len:
+                unclamped_credit += float(self.success_bonus)
 
-            self.credit = max(self.credit_min, min(self.credit_max, unclamped_credit))
+            self.credit = max(
+                self.credit_min,
+                min(self.credit_max, int(round(unclamped_credit))),
+            )
         else:
             unclamped_credit = self.credit
 
@@ -84,6 +119,12 @@ class DasdCreditController:
             "accepted_len": accepted_len,
             "proposed_len": proposed_len,
             "rejected_len": rejected_len,
+            "acceptance_ratio": acceptance_ratio,
+            "acceptance_ratio_ema": self.acceptance_ratio_ema,
+            "rtt_ms": float(rtt_ms),
+            "rtt_ema_ms": self.rtt_ema_ms,
+            "inflight_count": inflight_count,
+            "inflight_ema": self.inflight_ema,
             "strong_accept_streak_before": streak_before["strong_accept_streak"],
             "full_rejection_streak_before": streak_before["full_rejection_streak"],
             "strong_accept_streak": self.strong_accept_streak,
@@ -362,6 +403,11 @@ class DasdRequestState:
     suppressed_retry_last_fingerprint: tuple[int, ...] | None = None
     suppressed_retry_last_blocked_tokens: tuple[int, ...] | None = None
     last_suppressed_retry_reason: str = ""
+    suffix_refresh_last_attempt_key: tuple[int, int] | None = None
+    tiny_rebuild_last_attempt_key: tuple[int, int] | None = None
+    suffix_refresh_guard_skip_count: int = 0
+    tiny_rebuild_guard_skip_count: int = 0
+    conservative_forward_entry_count: int = 0
     sum_window_at_send: int = 0
     sum_tree_depth_at_send: int = 0
     sum_leaf_budget_at_send: int = 0
@@ -380,6 +426,7 @@ class DasdRequestState:
     last_frontier_sync_reason: str = ""
     last_pipeline_resume_reason: str = ""
     last_recovery_resend_relax_reason: str = ""
+    last_conservative_forward_reason: str = ""
     suffix_refresh_anchor_committed_len: int | None = None
     cleanup_reason: str = ""
     cleanup_induced_drain: bool = False

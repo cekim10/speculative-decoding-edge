@@ -94,6 +94,8 @@ class SpecEdgeClientConfig(metaclass=_ConfigMeta):
 
         # model configuration
         cls.draft_model = cls._from_env("SPECEDGE_DRAFT_MODEL")
+        cls.drafter_model = os.getenv("SPECEDGE_DRAFTER_MODEL", cls.draft_model)
+        cls.draft_model = cls.drafter_model
         cls.device = torch.device(cls._from_env("SPECEDGE_DEVICE"))
         cls.dtype = util.convert_dtype(cls._from_env("SPECEDGE_DTYPE"))
         cls.reasoning = cls._from_env("SPECEDGE_REASONING") == "True"
@@ -163,6 +165,21 @@ class SpecEdgeClientConfig(metaclass=_ConfigMeta):
         )
         cls.dasd_credit_init = int(
             os.getenv("SPECEDGE_DASD_CREDIT_INIT", str(cls.dasd_start_window))
+        )
+        cls.dasd_credit_target_acceptance = float(
+            os.getenv("SPECEDGE_DASD_CREDIT_TARGET_ACCEPTANCE", "0.7")
+        )
+        cls.dasd_credit_alpha = float(
+            os.getenv("SPECEDGE_DASD_CREDIT_ALPHA", "2.0")
+        )
+        cls.dasd_credit_rtt_target_ms = float(
+            os.getenv("SPECEDGE_DASD_CREDIT_RTT_TARGET_MS", "40.0")
+        )
+        cls.dasd_credit_rtt_gain = float(
+            os.getenv("SPECEDGE_DASD_CREDIT_RTT_GAIN", "0.75")
+        )
+        cls.dasd_credit_inflight_gain = float(
+            os.getenv("SPECEDGE_DASD_CREDIT_INFLIGHT_GAIN", "0.5")
         )
         cls.dasd_rejection_penalty = int(
             os.getenv("SPECEDGE_DASD_REJECTION_PENALTY", "1")
@@ -260,6 +277,8 @@ class SpecEdgeBatchClientConfig(metaclass=_ConfigMeta):
 
         # model configuration
         cls.draft_model = cls._from_env("SPECEDGE_DRAFT_MODEL")
+        cls.drafter_model = os.getenv("SPECEDGE_DRAFTER_MODEL", cls.draft_model)
+        cls.draft_model = cls.drafter_model
         cls.device = torch.device(cls._from_env("SPECEDGE_CLIENT_DEVICE"))
         cls.dtype = util.convert_dtype(cls._from_env("SPECEDGE_DTYPE"))
 

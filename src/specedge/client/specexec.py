@@ -885,6 +885,34 @@ class SpecExecClient:
     def _clear_suffix_refresh_anchor(self, state: DasdRequestState):
         state.suffix_refresh_anchor_committed_len = None
 
+    def _current_recovery_attempt_key(self, state: DasdRequestState):
+        return (state.epoch, state.committed_len)
+
+    def _enter_conservative_forward_progress(
+        self,
+        state: DasdRequestState,
+        reason: str,
+    ):
+        state.conservative_forward_entry_count += 1
+        state.last_conservative_forward_reason = reason
+        self._enter_local_stabilization(state, reason=reason)
+        self._enter_recovery_mode(state, reason=reason)
+        self._enter_cooldown(state, reason=reason)
+        self._refresh_dasd_control_targets(
+            state,
+            reason="conservative_forward_enter",
+            next_credit=1,
+        )
+        if not state.fallback_burst_active:
+            self._enter_fallback_burst(state, reason=reason)
+        self._log_dasd_state_event(
+            "mitigation_decision",
+            state,
+            decision_reason="conservative_forward_progress",
+            base_token_index=state.committed_len,
+            recovery_reason=reason,
+        )
+
     def _reset_suppressed_retry_loop_state(self, state: DasdRequestState, reason: str):
         state.suppressed_retry_loop_count = 0
         state.suppressed_retry_last_committed_len = None
@@ -942,6 +970,8 @@ class SpecExecClient:
         state.frontier_local_tiny_rebuild_root_child_last_signature = None
         state.frontier_local_tiny_rebuild_root_child_last_reason = reason
         state.frontier_local_tiny_rebuild_root_step_mask_last_reason = reason
+        state.suffix_refresh_last_attempt_key = None
+        state.tiny_rebuild_last_attempt_key = None
 
     def _activate_tiny_rebuild_root_step_mask(
         self,
@@ -1221,6 +1251,20 @@ class SpecExecClient:
         state: DasdRequestState,
         reason: str,
     ):
+        attempt_key = self._current_recovery_attempt_key(state)
+        if state.tiny_rebuild_last_attempt_key == attempt_key:
+            state.tiny_rebuild_guard_skip_count += 1
+            state.frontier_local_tiny_rebuild_last_reason = (
+                "frontier_local_tiny_rebuild_already_attempted"
+            )
+            self._log_dasd_state_event(
+                "frontier_local_tiny_rebuild_fail",
+                state,
+                decision_reason="frontier_local_tiny_rebuild_already_attempted",
+                base_token_index=state.committed_len,
+            )
+            return False, "frontier_local_tiny_rebuild_already_attempted"
+        state.tiny_rebuild_last_attempt_key = attempt_key
         base_token_index = state.committed_len
         blocked_token_id = self._get_frontier_blocked_token_id(state)
         blocked_tokens = self._compute_blocked_tokens_for_prefix(state)
@@ -2060,6 +2104,11 @@ class SpecExecClient:
         return False, last_reason
 
     def _perform_suffix_refresh(self, state: DasdRequestState, reason: str):
+        attempt_key = self._current_recovery_attempt_key(state)
+        if state.suffix_refresh_last_attempt_key == attempt_key:
+            state.suffix_refresh_guard_skip_count += 1
+            return False, "suffix_refresh_already_attempted"
+        state.suffix_refresh_last_attempt_key = attempt_key
         state.suffix_refresh_attempt_count += 1
         state.last_suffix_refresh_reason = reason
         state.last_mitigation_decision_reason = reason
@@ -2079,6 +2128,7 @@ class SpecExecClient:
             state,
             min_required_end=state.next_base_index + state.window_size,
             phase="suffix_refresh",
+            max_attempts=1,
         )
         if regenerated:
             sendable_after_refresh, frontier_reason = (
@@ -2245,8 +2295,10 @@ class SpecExecClient:
                 state,
                 min_required_end=state.next_base_index + state.window_size,
                 phase=reason,
+                max_attempts=1,
             )
             if not regenerated:
+                state.last_recovery_failure_reason = regeneration_reason
                 self._log_refill_decision(
                     state,
                     phase=reason,
@@ -2281,6 +2333,8 @@ class SpecExecClient:
                 phase=reason,
                 allow_regeneration=False,
             )
+            if not state.inflight:
+                state.last_recovery_failure_reason = refill_result.get("reason", "")
             if (
                 not state.inflight
                 and refill_result.get("reason") in {
@@ -2589,6 +2643,11 @@ class SpecExecClient:
                 max_tree_depth=config.dasd_max_tree_depth,
                 min_leaf_budget=config.dasd_min_leaf_budget,
                 max_leaf_budget=config.dasd_max_leaf_budget,
+                target_acceptance_ratio=config.dasd_credit_target_acceptance,
+                alpha=config.dasd_credit_alpha,
+                rtt_target_ms=config.dasd_credit_rtt_target_ms,
+                rtt_gain=config.dasd_credit_rtt_gain,
+                inflight_gain=config.dasd_credit_inflight_gain,
             ),
         )
         self._refresh_dasd_control_targets(
@@ -2661,11 +2720,14 @@ class SpecExecClient:
                         state.send_spawn_after_rebuild_count,
                     )
                     state.unexpected_stall_count += 1
-                    await self._abort_dasd_request(
+                    self._enter_conservative_forward_progress(
                         state,
-                        reason="unexpected_empty_inflight_recovery_failed",
+                        reason=(
+                            state.last_recovery_failure_reason
+                            or "unexpected_empty_inflight_recovery_failed"
+                        ),
                     )
-                    finish_status = "explicit_abort_reason"
+                    continue
                 else:
                     self._log_finish_condition(state, reason="loop_exit_no_inflight")
                 break
@@ -2890,6 +2952,9 @@ class SpecExecClient:
                 "suppressed_retry_loop_count": state.suppressed_retry_loop_count,
                 "suppressed_retry_loop_break_count": state.suppressed_retry_loop_break_count,
                 "suppressed_retry_loop_escalation_count": state.suppressed_retry_loop_escalation_count,
+                "suffix_refresh_guard_skip_count": state.suffix_refresh_guard_skip_count,
+                "tiny_rebuild_guard_skip_count": state.tiny_rebuild_guard_skip_count,
+                "conservative_forward_entry_count": state.conservative_forward_entry_count,
                 "last_suppressed_retry_reason": state.last_suppressed_retry_reason,
                 "last_rollback_cause": state.last_rollback_cause,
                 "last_retry_decision_reason": state.last_retry_decision_reason,
@@ -2902,6 +2967,7 @@ class SpecExecClient:
                 "last_frontier_sync_reason": state.last_frontier_sync_reason,
                 "last_pipeline_resume_reason": state.last_pipeline_resume_reason,
                 "last_recovery_resend_relax_reason": state.last_recovery_resend_relax_reason,
+                "last_conservative_forward_reason": state.last_conservative_forward_reason,
                 "average_W": (
                     state.sum_window_at_send / state.verify_rounds
                     if state.verify_rounds > 0
@@ -4390,6 +4456,8 @@ class SpecExecClient:
                 control_feedback = state.credit_controller.apply_feedback(
                     accepted_len=accepted_len,
                     proposed_len=verified_len,
+                    rtt_ms=rtt_ms,
+                    inflight_count=len(state.inflight),
                 )
             self._refresh_dasd_control_targets(
                 state,
@@ -4955,17 +5023,11 @@ class SpecExecClient:
         if leaf_indices.numel() == 0:
             leaf_indices = all_indices
 
-        leaf_depths = self._tree.positions[leaf_indices]
-        max_depth = leaf_depths.max()
-        deepest = leaf_indices[leaf_depths == max_depth]
-        if deepest.numel() == 1:
-            best_leaf = deepest[0]
-        else:
-            best_leaf = deepest[self._tree.logprobs[deepest].argmax()]
+        candidate_leaves = leaf_indices
 
         blocked_token = None
         blocked_tokens = set()
-        filtered_leaf_indices = deepest
+        filtered_leaf_indices = candidate_leaves
         filtered_first_tokens = None
         if state is not None:
             if (
@@ -4982,7 +5044,7 @@ class SpecExecClient:
             first_tokens = torch.tensor(
                 [
                     self._first_continuation_token_for_leaf(int(leaf_idx.item()))
-                    for leaf_idx in deepest
+                    for leaf_idx in candidate_leaves
                 ],
                 dtype=torch.long,
                 device=self._device,
@@ -4993,34 +5055,56 @@ class SpecExecClient:
             keep_mask = ~torch.isin(first_tokens, blocked_tensor)
             filtered_first_tokens = first_tokens.tolist()
             if torch.any(keep_mask):
-                filtered_leaf_indices = deepest[keep_mask]
-                if filtered_leaf_indices.numel() == 1:
-                    best_leaf = filtered_leaf_indices[0]
-                else:
-                    best_leaf = filtered_leaf_indices[
-                        self._tree.logprobs[filtered_leaf_indices].argmax()
-                    ]
+                filtered_leaf_indices = candidate_leaves[keep_mask]
                 if config.dasd_debug:
                     self._logger.info(
-                        "[DASD] rollback_filter req=%s epoch=%d committed=%d blocked_token=%s deepest_leaves=%s deepest_first_tokens=%s kept_leaves=%s",
+                        "[DASD] rollback_filter req=%s epoch=%d committed=%d blocked_token=%s candidate_leaves=%s candidate_first_tokens=%s kept_leaves=%s",
                         state.request_id,
                         state.epoch,
                         state.committed_len,
                         sorted(blocked_tokens),
-                        deepest.tolist(),
+                        candidate_leaves.tolist(),
                         filtered_first_tokens,
                         filtered_leaf_indices.tolist(),
                     )
             elif config.dasd_debug:
                 self._logger.info(
-                    "[DASD] rollback_filter req=%s epoch=%d committed=%d blocked_token=%s no_alternative_leaf deepest_leaves=%s deepest_first_tokens=%s",
+                    "[DASD] rollback_filter req=%s epoch=%d committed=%d blocked_token=%s no_alternative_leaf candidate_leaves=%s candidate_first_tokens=%s",
                     state.request_id,
                     state.epoch,
                     state.committed_len,
                     sorted(blocked_tokens),
-                    deepest.tolist(),
+                    candidate_leaves.tolist(),
                     filtered_first_tokens,
                 )
+
+        candidate_list = filtered_leaf_indices.tolist()
+
+        def _leaf_priority(leaf_idx: int):
+            depth = int(self._tree.positions[leaf_idx].item())
+            logprob = float(self._tree.logprobs[leaf_idx].item())
+            rollback_risk = 0.0
+            if state is not None:
+                first_token = self._first_continuation_token_for_leaf(leaf_idx)
+                if first_token in blocked_tokens:
+                    rollback_risk += 8.0
+                if (
+                    state.rollback_blocked_committed_len == state.committed_len
+                    and state.rollback_blocked_token_id is not None
+                    and int(first_token) == int(state.rollback_blocked_token_id)
+                ):
+                    rollback_risk += 4.0
+                rollback_risk += 0.2 * max(
+                    0,
+                    state.base_retry_counts.get(state.committed_len, 0) - 1,
+                )
+            return logprob + 0.25 * depth - rollback_risk
+
+        best_leaf = torch.tensor(
+            max(candidate_list, key=_leaf_priority),
+            dtype=torch.long,
+            device=self._device,
+        )
 
         path_indices = []
         cursor = best_leaf

@@ -512,6 +512,12 @@ class DasdRequestState:
     same_base_rollback_guard_skip_count: int = 0
     same_base_rollback_reopen_guard_skip_count: int = 0
     same_base_rollback_fast_path_count: int = 0
+    same_base_rollback_quarantine_active: bool = False
+    same_base_rollback_quarantine_reason: str = ""
+    same_base_rollback_quarantine_entry_count: int = 0
+    same_base_rollback_quarantine_exit_count: int = 0
+    same_base_rollback_quarantine_send_gate_count: int = 0
+    same_base_rollback_stale_abort_count: int = 0
     last_same_base_rollback_reason: str = ""
     suffix_refresh_anchor_frontier_key: Any | None = None
     suffix_refresh_closed_family_identity: Any | None = None

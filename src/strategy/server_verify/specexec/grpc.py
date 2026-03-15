@@ -940,6 +940,40 @@ class DasdInferenceController:
             reason=reason,
         )
 
+    def _clear_retired_request(self, client_id: str, request_id: str, reason: str):
+        key = (client_id, request_id)
+        retired_reason = self._retired_requests.pop(key, None)
+        if retired_reason is None:
+            return
+        self._dasd_debug_log(
+            "clear_retired_request",
+            client_id=client_id,
+            request_id=request_id,
+            reason=reason,
+            retired_reason=retired_reason,
+        )
+
+    def _can_reactivate_retired_request(
+        self,
+        request: specedge_pb2.VerifyBundleRequest,
+        active_state: DasdVerifierState | None,
+        retired_reason: str,
+    ) -> bool:
+        if active_state is not None:
+            return False
+        if retired_reason != "request_switch":
+            return False
+        return int(request.base_token_index) == 0
+
+    def _reactivate_retired_request(self, request: specedge_pb2.VerifyBundleRequest):
+        request_epoch_key = self._request_epoch_key(request.client_id, request.request_id)
+        self._request_epochs.pop(request_epoch_key, None)
+        self._clear_retired_request(
+            request.client_id,
+            request.request_id,
+            reason="fresh_request_reactivation",
+        )
+
     def _request_epoch_key(self, client_id: str, request_id: str):
         return (client_id, request_id)
 
@@ -1263,15 +1297,34 @@ class DasdInferenceController:
         if retired_reason is not None and (
             active_state is None or active_state.request_id != request.request_id
         ):
-            self._dasd_debug_log(
-                "retired_request_drop",
-                request=request,
-                reason=retired_reason,
-            )
-            return self._safe_reject_bundle(
+            if self._can_reactivate_retired_request(
                 request,
-                token_window,
-                reason=f"late_bundle_after_cleanup:{retired_reason}",
+                active_state=active_state,
+                retired_reason=retired_reason,
+            ):
+                self._dasd_debug_log(
+                    "reactivate_retired_request",
+                    request=request,
+                    reason=retired_reason,
+                )
+                self._reactivate_retired_request(request)
+                retired_reason = None
+            else:
+                self._dasd_debug_log(
+                    "retired_request_drop",
+                    request=request,
+                    reason=retired_reason,
+                )
+                return self._safe_reject_bundle(
+                    request,
+                    token_window,
+                    reason=f"late_bundle_after_cleanup:{retired_reason}",
+                )
+        if retired_reason is not None and active_state is not None and active_state.request_id == request.request_id:
+            self._clear_retired_request(
+                request.client_id,
+                request.request_id,
+                reason="active_request_reuse",
             )
 
         terminal_reason = self._terminal_failed_requests.get(
@@ -1490,6 +1543,11 @@ class DasdInferenceController:
             )
 
         if state is not None and state.request_id == request_id:
+            self._clear_retired_request(
+                client_id,
+                request_id,
+                reason="state_reuse",
+            )
             previous_committed_len = len(state.committed_tokens) - state.prompt_len
             if epoch < state.epoch:
                 raise RuntimeError(
@@ -1622,6 +1680,11 @@ class DasdInferenceController:
             state=state,
             token_window=[],
             new_state=True,
+        )
+        self._clear_retired_request(
+            client_id,
+            request_id,
+            reason="state_created",
         )
         return state
 

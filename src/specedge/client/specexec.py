@@ -907,6 +907,11 @@ class SpecExecClient:
     def _enter_recovery_resend_relax(
         self, state: DasdRequestState, reason: str, attempts: int = 2
     ):
+        if state.same_base_rollback_quarantine_active:
+            state.last_recovery_resend_relax_reason = (
+                f"quarantine_blocked:{reason}"
+            )
+            return
         if state.recovery_resend_relax_active:
             state.recovery_resend_relax_attempts_remaining = max(
                 state.recovery_resend_relax_attempts_remaining,
@@ -973,6 +978,8 @@ class SpecExecClient:
             return False
         if not token_ids:
             return False
+        if state.same_base_rollback_quarantine_active:
+            return False
         blocked_tokens = self._compute_blocked_tokens_for_prefix(state)
         if token_ids[0] in blocked_tokens:
             return False
@@ -991,6 +998,7 @@ class SpecExecClient:
         return (
             state.frontier_sync_active
             or state.cleanup_induced_drain
+            or state.same_base_rollback_quarantine_active
             or (
                 (state.local_stabilization_active or state.recovery_mode_active)
                 and not state.pipeline_resume_grace_active
@@ -1218,6 +1226,29 @@ class SpecExecClient:
             state.same_base_rollback_reopen_block_prefix_key = None
         state.last_same_base_rollback_reason = reason
 
+    def _enter_same_base_rollback_quarantine(
+        self,
+        state: DasdRequestState,
+        reason: str,
+    ):
+        if not state.same_base_rollback_quarantine_active:
+            state.same_base_rollback_quarantine_active = True
+            state.same_base_rollback_quarantine_entry_count += 1
+        state.same_base_rollback_quarantine_reason = reason
+        state.last_same_base_rollback_reason = reason
+
+    def _exit_same_base_rollback_quarantine(
+        self,
+        state: DasdRequestState,
+        reason: str,
+    ):
+        if not state.same_base_rollback_quarantine_active:
+            return
+        state.same_base_rollback_quarantine_active = False
+        state.same_base_rollback_quarantine_reason = ""
+        state.same_base_rollback_quarantine_exit_count += 1
+        state.last_same_base_rollback_reason = reason
+
     def _same_base_rollback_family_key(
         self,
         state: DasdRequestState,
@@ -1277,6 +1308,9 @@ class SpecExecClient:
         )
         state.same_base_rollback_reopen_block_prefix_key = self._dasd_prefix_key(state)
         state.last_same_base_rollback_reason = reason
+
+    def _is_control_plane_stale_reject(self, reject_reason: str) -> bool:
+        return reject_reason.startswith("late_bundle_after_cleanup:")
 
     def _suffix_refresh_anchor_key(self, state: DasdRequestState):
         return (
@@ -2743,6 +2777,7 @@ class SpecExecClient:
         ):
             state.same_base_rollback_guard_skip_count += 1
             state.same_base_rollback_fast_path_count += 1
+            state.same_base_rollback_quarantine_send_gate_count += 1
             state.last_same_base_rollback_reason = "same_base_dead_family"
             return True, "same_base_dead_family"
         if (
@@ -2751,6 +2786,7 @@ class SpecExecClient:
         ):
             state.same_base_rollback_reopen_guard_skip_count += 1
             state.same_base_rollback_fast_path_count += 1
+            state.same_base_rollback_quarantine_send_gate_count += 1
             state.last_same_base_rollback_reason = "forced_commit_reopen_blocked"
             return True, "forced_commit_reopen_blocked"
         if state.base_retry_counts.get(base_token_index, 0) <= 1:
@@ -2776,6 +2812,10 @@ class SpecExecClient:
         if rollback_cause == "rollback_due_to_state_inconsistency":
             return False
         if rollback_cause == "rollback_due_to_contiguous_commit_mismatch":
+            return False
+        if rollback_cause == "rollback_due_to_cleanup_stale_response":
+            return False
+        if state.same_base_rollback_quarantine_active:
             return False
         retry_count = state.base_retry_counts.get(base_token_index, 0)
         if self._same_base_rollback_closed_prefix_key(state) == self._dasd_prefix_key(
@@ -3531,6 +3571,12 @@ class SpecExecClient:
                 "same_base_rollback_guard_skip_count": state.same_base_rollback_guard_skip_count,
                 "same_base_rollback_reopen_guard_skip_count": state.same_base_rollback_reopen_guard_skip_count,
                 "same_base_rollback_fast_path_count": state.same_base_rollback_fast_path_count,
+                "same_base_rollback_quarantine_active": state.same_base_rollback_quarantine_active,
+                "same_base_rollback_quarantine_reason": state.same_base_rollback_quarantine_reason,
+                "same_base_rollback_quarantine_entry_count": state.same_base_rollback_quarantine_entry_count,
+                "same_base_rollback_quarantine_exit_count": state.same_base_rollback_quarantine_exit_count,
+                "same_base_rollback_quarantine_send_gate_count": state.same_base_rollback_quarantine_send_gate_count,
+                "same_base_rollback_stale_abort_count": state.same_base_rollback_stale_abort_count,
                 "same_base_rollback_closed_family_identity": state.same_base_rollback_closed_family_identity,
                 "same_base_rollback_reopen_block_prefix_key": state.same_base_rollback_reopen_block_prefix_key,
                 "suffix_refresh_guard_skip_count": state.suffix_refresh_guard_skip_count,
@@ -4192,10 +4238,11 @@ class SpecExecClient:
         state.committed_len += 1
         state.next_base_index = state.committed_len
         self._clear_suffix_refresh_anchor(state)
-        self._reset_same_base_rollback_family_state(
-            state,
-            reason="fallback_burst_progress",
-        )
+        if not state.same_base_rollback_quarantine_active:
+            self._reset_same_base_rollback_family_state(
+                state,
+                reason="fallback_burst_progress",
+            )
         self._reset_suppressed_retry_loop_state(state, reason="fallback_burst_progress")
         self._reset_alternative_frontier_search_state(
             state, reason="fallback_burst_progress"
@@ -5176,6 +5223,10 @@ class SpecExecClient:
             state.committed_len += accepted_len
             if accepted_len > 0:
                 self._clear_suffix_refresh_anchor(state)
+                self._exit_same_base_rollback_quarantine(
+                    state,
+                    reason="committed_progress",
+                )
                 self._reset_same_base_rollback_family_state(
                     state,
                     reason="committed_progress",
@@ -5228,6 +5279,10 @@ class SpecExecClient:
                     reason="full_rejection",
                 )
                 if rollback_family_newly_closed:
+                    self._enter_same_base_rollback_quarantine(
+                        state,
+                        reason="same_base_dead_family",
+                    )
                     state.same_base_rollback_fast_path_count += 1
                     self._enter_fallback_burst(
                         state,
@@ -5473,6 +5528,18 @@ class SpecExecClient:
                 state.stale_epoch_drop_count += 1
             elif reject_reason.startswith("late_bundle_after_cleanup"):
                 state.late_task_drop_count += 1
+                self._enter_same_base_rollback_quarantine(
+                    state,
+                    reason="cleanup_stale_response",
+                )
+                state.same_base_rollback_stale_abort_count += 1
+                state.aborted = True
+                state.abort_reason = reject_reason
+                abort_task = asyncio.create_task(
+                    self._abort_dasd_request(state, reason=reject_reason)
+                )
+                abort_task.add_done_callback(lambda _: None)
+                return
 
             if (
                 accepted_len == 0
@@ -5502,6 +5569,8 @@ class SpecExecClient:
                     rollback_cause = "rollback_due_to_failure_cache_blocked_suffix"
                 if state.recovery_mode_active:
                     rollback_cause = "rollback_due_to_post_recovery_rejection"
+                if self._is_control_plane_stale_reject(reject_reason):
+                    rollback_cause = "rollback_due_to_cleanup_stale_response"
                 self._record_rollback_cause(
                     state,
                     cause=rollback_cause,
@@ -5649,6 +5718,7 @@ class SpecExecClient:
             return
         state.aborted = True
         self._clear_suffix_refresh_anchor(state)
+        self._exit_same_base_rollback_quarantine(state, reason=reason)
         self._reset_alternative_frontier_search_state(state, reason=reason)
         self._exit_pipeline_resume_grace(state, reason=reason, success=False)
         self._reset_recovery_resend_relax_state(state, reason=reason)

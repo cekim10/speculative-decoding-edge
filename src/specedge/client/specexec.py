@@ -1442,6 +1442,30 @@ class SpecExecClient:
         state.frontier_local_tiny_rebuild_root_step_mask_last_reason = reason
         state.tiny_rebuild_last_attempt_key = None
 
+    def _reset_retry_window_for_base(
+        self,
+        state: DasdRequestState,
+        base_token_index: int,
+        reason: str,
+    ):
+        if base_token_index < 0:
+            return
+        state.base_retry_counts.pop(base_token_index, None)
+        state.retry_fingerprints_by_base.pop(base_token_index, None)
+        lifecycle = state.base_lifecycle.get(base_token_index)
+        if lifecycle is not None:
+            lifecycle["retry_fingerprints"] = {}
+            lifecycle["unique_retry_fingerprints"] = set()
+        self._reset_suppressed_retry_loop_state(state, reason=reason)
+        state.last_retry_quality_reason = ""
+        state.last_retry_decision_reason = reason
+        self._log_dasd_state_event(
+            "retry_window_reset",
+            state,
+            decision_reason=reason,
+            base_token_index=base_token_index,
+        )
+
     def _activate_tiny_rebuild_root_step_mask(
         self,
         state: DasdRequestState,
@@ -2365,6 +2389,7 @@ class SpecExecClient:
         before_next_base = state.next_base_index
         before_drafted_len = len(state.drafted_tokens)
         before_pending_responses = len(state.responses_by_base)
+        reset_base_token_index = state.committed_len
         if config.dasd_debug:
             self._logger.info(
                 "[DASD] rebuild_restart_begin req=%s epoch=%d committed=%d drafted=%d next_base=%d inflight=%d pending=%d reason=%s credit=%s W=%d tree_depth=%s leaf_budget=%s",
@@ -2385,6 +2410,11 @@ class SpecExecClient:
         state.drafted_tokens = state.drafted_tokens[: state.committed_len]
         state.responses_by_base.clear()
         state.cleanup_induced_drain = False
+        self._reset_retry_window_for_base(
+            state,
+            reset_base_token_index,
+            reason=f"rebuild_restart:{reason}",
+        )
         if (
             before_next_base != state.next_base_index
             or before_drafted_len != len(state.drafted_tokens)
